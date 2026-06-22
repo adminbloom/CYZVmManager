@@ -343,16 +343,15 @@ public class HyperVImportService
 
                 Remove-PSSession $session
 
+                # Restart the VM to apply the rename, then wait for it to come back up.
                 Invoke-Command -Session (New-PSSession -VMName $vmName -Credential $cred) -ScriptBlock { Restart-Computer -Force }
                 Start-Sleep -Seconds 10
             } finally {
+                # Wait for the VM to return to Running after the restart.
                 $tries3 = 0
                 while ($tries3 -lt 30) {
                     $vm = Get-VM -Name $vmName -ErrorAction SilentlyContinue
-                    if ($vm -and $vm.State -eq 'Off') { break }
-                    if ($vm -and $vm.State -ne 'Off' -and $tries3 -ge 25) {
-                        Stop-VM -Name $vmName -Force -ErrorAction SilentlyContinue
-                    }
+                    if ($vm -and $vm.State -eq 'Running') { break }
                     Start-Sleep -Seconds 2
                     $tries3++
                 }
