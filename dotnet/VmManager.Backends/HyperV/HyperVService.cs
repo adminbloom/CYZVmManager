@@ -69,7 +69,8 @@ public class HyperVService : IVmBackend
         string? vmName = null,
         bool skipDefaultNetwork = false,
         Action<string>? onStatus = null,
-        CancellationToken cancellationToken = default
+        CancellationToken cancellationToken = default,
+        string? vmSwitch = null
     ) =>
         Import.ImportVmAsync(
             extractedFolder,
@@ -77,7 +78,8 @@ public class HyperVService : IVmBackend
             memoryMb,
             cpuCount,
             vmName,
-            skipDefaultNetwork
+            skipDefaultNetwork,
+            vmSwitch
         );
 
     public async Task<string?> TroubleshootAsync() => await Vms.TroubleshootVmListingAsync();

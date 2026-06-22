@@ -134,7 +134,8 @@ public sealed class FakeVmBackend : IVmBackend
         string? vmName = null,
         bool skipDefaultNetwork = false,
         Action<string>? onStatus = null,
-        CancellationToken cancellationToken = default
+        CancellationToken cancellationToken = default,
+        string? vmSwitch = null
     )
     {
         onStatus?.Invoke("Copying disk image...");

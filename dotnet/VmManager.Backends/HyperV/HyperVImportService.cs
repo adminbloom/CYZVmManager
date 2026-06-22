@@ -26,7 +26,8 @@ public class HyperVImportService
         int memoryMb,
         int cpuCount,
         string? vmName = null,
-        bool skipDefaultNetwork = false
+        bool skipDefaultNetwork = false,
+        string? vmSwitch = null
     )
     {
         _logger.LogInformation(
@@ -86,9 +87,10 @@ public class HyperVImportService
             Set-VMKeyProtector -VMName $vmName -NewLocalKeyProtector
             Enable-VMTPM       -VMName $vmName
 
-            {{(skipDefaultNetwork ? "" : @"$sw = Get-VMSwitch -Name 'Default Switch' -ErrorAction SilentlyContinue
-            if (-not $sw) { $sw = Get-VMSwitch | Select-Object -First 1 }
-            if ($sw) { Add-VMNetworkAdapter -VMName $vmName -SwitchName $sw.Name }")}}
+            {{(skipDefaultNetwork ? "" : @$"$switchName = {PowerShellRunner.Q(vmSwitch ?? "Default Switch")}
+            $sw = Get-VMSwitch -Name $switchName -ErrorAction SilentlyContinue
+            if (-not $sw) {{ $sw = Get-VMSwitch | Select-Object -First 1 }}
+            if ($sw) {{ Add-VMNetworkAdapter -VMName $vmName -SwitchName $sw.Name }}")}}
             """;
 
         await _ps.RunPsAsync(script);

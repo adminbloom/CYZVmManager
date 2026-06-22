@@ -20,6 +20,7 @@ public class AppSettings
     public string RdpDomainSuffix { get; set; } = "";
 
     public string VmBackend { get; set; } = "HyperV";
+    public string VmSwitch { get; set; } = "Default Switch";
 
     public bool RenameComputerToVmName { get; set; } = true;
     public string PostCreationScript { get; set; } = "";

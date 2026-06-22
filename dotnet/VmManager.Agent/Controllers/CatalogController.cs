@@ -432,7 +432,8 @@ public class CatalogController : ControllerBase
                         request.Name,
                         skipDefaultNetwork: networkMappings != null && networkMappings.Count > 0,
                         onStatus: status => ctx.ReportProgress(-1, status),
-                        cancellationToken: ctx.Token
+                        cancellationToken: ctx.Token,
+                        vmSwitch: settings.VmSwitch
                     );
                 }
                 catch (OrphanedVmException ex)

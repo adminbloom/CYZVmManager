@@ -22,7 +22,8 @@ public interface IVmBackend
         string? vmName = null,
         bool skipDefaultNetwork = false,
         Action<string>? onStatus = null,
-        CancellationToken cancellationToken = default
+        CancellationToken cancellationToken = default,
+        string? vmSwitch = null
     );
     Task ConnectToVmAsync(string vmName, string username = "", string password = "");
     Task ExportSnapshotAsync(string snapshotId, string destDir);

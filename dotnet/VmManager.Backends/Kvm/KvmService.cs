@@ -65,7 +65,8 @@ public class KvmService : IVmBackend
         string? vmName = null,
         bool skipDefaultNetwork = false,
         Action<string>? onStatus = null,
-        CancellationToken cancellationToken = default
+        CancellationToken cancellationToken = default,
+        string? vmSwitch = null
     ) =>
         Import.ImportVmAsync(
             extractedFolder,
