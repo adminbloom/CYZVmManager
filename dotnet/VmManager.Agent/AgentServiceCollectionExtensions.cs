@@ -2,9 +2,11 @@ using VmManager.Agent.Services;
 using VmManager.Agent.Services.Monitoring;
 using VmManager.Agent.Services.Monitoring.Checks;
 using VmManager.Agent.Services.Rdp;
+using VmManager.Backends.HyperV;
 using VmManager.Backends.Kvm;
 using VmManager.Backends.Proxmox;
 using VmManager.Catalog.Shared;
+using VmManager.Contracts.Interfaces;
 using VmManager.Contracts.Models;
 
 namespace VmManager.Agent;
@@ -33,6 +35,7 @@ public static class AgentServiceCollectionExtensions
         {
             services.AddSingleton<IVmBackend, FakeVmBackend>();
             services.AddSingleton<IVmIpResolver>(sp => new FakeIpResolver());
+            services.AddSingleton<IVmExecService, FakeExecService>();
         }
         else if (string.Equals(backendOverride, "Proxmox", StringComparison.OrdinalIgnoreCase))
         {
@@ -53,16 +56,20 @@ public static class AgentServiceCollectionExtensions
             services.AddSingleton<ProxmoxIpResolver>();
             services.AddSingleton<IVmIpResolver>(sp => sp.GetRequiredService<ProxmoxIpResolver>());
             services.AddSingleton<ProxmoxTemplateRegistry>();
+            services.AddSingleton<IVmExecService, NotImplementedExecService>();
         }
         else if (OperatingSystem.IsWindows())
         {
             services.AddSingleton<VmIpResolver>();
             services.AddSingleton<IVmIpResolver>(sp => sp.GetRequiredService<VmIpResolver>());
+            services.AddSingleton<HyperVExecService>();
+            services.AddSingleton<IVmExecService>(sp => sp.GetRequiredService<HyperVExecService>());
         }
         else if (OperatingSystem.IsLinux())
         {
             services.AddSingleton<KvmIpResolver>();
             services.AddSingleton<IVmIpResolver>(sp => sp.GetRequiredService<KvmIpResolver>());
+            services.AddSingleton<IVmExecService, NotImplementedExecService>();
         }
 
         services.AddSingleton<RdpTcpRelay>();

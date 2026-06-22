@@ -15,6 +15,12 @@ public class UserService
     private static readonly JsonSerializerOptions WriteOptions = new JsonSerializerOptions
     {
         WriteIndented = true,
+        PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
+    };
+
+    private static readonly JsonSerializerOptions ReadOptions = new JsonSerializerOptions
+    {
+        PropertyNameCaseInsensitive = true,
     };
 
     public UserService(IAppPaths paths, ILogger<UserService> logger)
@@ -370,7 +376,7 @@ public class UserService
         try
         {
             string json = File.ReadAllText(_usersPath);
-            return JsonSerializer.Deserialize<List<UserAccount>>(json) ?? [];
+            return JsonSerializer.Deserialize<List<UserAccount>>(json, ReadOptions) ?? [];
         }
         catch (Exception ex)
         {

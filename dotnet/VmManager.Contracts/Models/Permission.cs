@@ -29,6 +29,10 @@ public static class Permission
 
     public const string RdpConnect = "rdp.connect";
 
+    /// <summary>Execute PowerShell scripts inside a VM via POST /api/vms/{name}/exec.
+    /// Requires AllowExec=true in settings.json. Included in DefaultUser set.</summary>
+    public const string VmExec = "vm.exec";
+
     public const string UsersManage = "users.manage";
 
     public const string MonitoringView = "monitoring.view";
@@ -60,13 +64,14 @@ public static class Permission
         SettingsManageFeeds,
         SettingsEditScripts,
         RdpConnect,
+        VmExec,
         UsersManage,
         MonitoringView,
         MonitoringManage,
     ];
 
     public static HashSet<string> DefaultUser { get; } =
-    [VmViewOwn, VmStart, VmStop, VmCreate, SnapshotCreate, CatalogBrowse, SettingsView, RdpConnect];
+    [VmViewOwn, VmStart, VmStop, VmCreate, SnapshotCreate, CatalogBrowse, SettingsView, RdpConnect, VmExec];
 
     public static HashSet<string> Shareable { get; } =
     [VmStart, VmStop, VmReset, RdpConnect, SnapshotCreate, SnapshotRestore];

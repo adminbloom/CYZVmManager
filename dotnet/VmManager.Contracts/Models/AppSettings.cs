@@ -27,6 +27,13 @@ public class AppSettings
 
     public bool AutoCleanupUnusedNetworks { get; set; } = true;
 
+    /// <summary>
+    /// If true, allows executing PowerShell scripts inside VMs via
+    /// POST /api/vms/{name}/exec. Requires the vm.exec permission.
+    /// Default: false (disabled for security).
+    /// </summary>
+    public bool AllowExec { get; set; }
+
     public ProxmoxSettings? Proxmox { get; set; }
 
     public string SmtpHost { get; set; } = "";

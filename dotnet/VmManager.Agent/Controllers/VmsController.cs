@@ -3,6 +3,9 @@ using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
 using VmManager.Agent.Services;
 using VmManager.Agent.Services.Monitoring;
+using VmManager.Backends.Shared;
+using VmManager.Contracts.Interfaces;
+using VmManager.Contracts.Models;
 
 namespace VmManager.Agent.Controllers;
 
@@ -25,6 +28,7 @@ public class VmsController : ControllerBase
     private readonly EmailService _emailService;
     private readonly UserService _userService;
     private readonly VmStopTracker _vmStopTracker;
+    private readonly IVmExecService _execService;
     private readonly ILogger<VmsController> _logger;
 
     public VmsController(
@@ -42,6 +46,7 @@ public class VmsController : ControllerBase
         EmailService emailService,
         UserService userService,
         VmStopTracker vmStopTracker,
+        IVmExecService execService,
         ILogger<VmsController> logger
     )
     {
@@ -55,6 +60,7 @@ public class VmsController : ControllerBase
         ArgumentNullException.ThrowIfNull(ipResolver);
         ArgumentNullException.ThrowIfNull(authorizationService);
         ArgumentNullException.ThrowIfNull(ownershipService);
+        ArgumentNullException.ThrowIfNull(execService);
         ArgumentNullException.ThrowIfNull(sharingService);
         ArgumentNullException.ThrowIfNull(emailService);
         ArgumentNullException.ThrowIfNull(userService);
@@ -74,6 +80,7 @@ public class VmsController : ControllerBase
         _emailService = emailService;
         _userService = userService;
         _vmStopTracker = vmStopTracker;
+        _execService = execService;
         _logger = logger;
     }
 
@@ -211,6 +218,77 @@ public class VmsController : ControllerBase
         catch
         {
             return Ok(new { ready = false });
+        }
+    }
+
+    /// <summary>
+    /// Execute a PowerShell script inside a VM. Tries WinRM first (network),
+    /// falls back to PowerShell Direct (VM bus) when WinRM is unavailable.
+    /// Requires AllowExec=true in settings.json and the vm.exec permission.
+    /// </summary>
+    /// <param name="name">VM name</param>
+    /// <param name="request">Script and timeout</param>
+    /// <returns>Exit code, stdout, and stderr from the script execution.</returns>
+    /// <response code="200">Script executed (check exitCode for result)</response>
+    /// <response code="400">Script is empty or too large</response>
+    /// <response code="403">Exec is disabled or user lacks permission</response>
+    /// <response code="502">Execution failed</response>
+    /// <response code="503">VM credentials not configured</response>
+    /// <response code="504">Script execution timed out</response>
+    [HttpPost("{name}/exec")]
+    [Authorize(Policy = Permission.VmExec)]
+    [ProducesResponseType(typeof(object), 200)]
+    [ProducesResponseType(typeof(object), 400)]
+    [ProducesResponseType(typeof(object), 403)]
+    [ProducesResponseType(typeof(object), 502)]
+    [ProducesResponseType(typeof(object), 503)]
+    [ProducesResponseType(typeof(object), 504)]
+    public async Task<IActionResult> ExecInVm(string name, [FromBody] ExecVmRequest request)
+    {
+        AppSettings settings = _settingsService.Load();
+        if (!settings.AllowExec)
+            return StatusCode(403, new { error = "Exec is disabled on this agent. Set AllowExec=true in settings.json to enable." });
+
+        if (!_authorizationService.CanAccessVm(User, name, Permission.VmExec))
+            return Forbid();
+
+        if (string.IsNullOrWhiteSpace(request.Script))
+            return BadRequest(new { error = "Script is required." });
+
+        if (request.Script.Length > 1_000_000)
+            return BadRequest(new { error = "Script too large (max 1 MB)." });
+
+        if (string.IsNullOrWhiteSpace(settings.DefaultVmUsername)
+            || string.IsNullOrWhiteSpace(settings.DefaultVmPassword))
+            return StatusCode(503, new { error = "DefaultVmUsername/DefaultVmPassword not configured in settings.json." });
+
+        int timeoutSeconds = request.Timeout > 0 ? request.Timeout : 60;
+        string scriptPreview = request.Script.Length > 200
+            ? request.Script[..200] + "..."
+            : request.Script;
+        string user = User.Identity?.Name ?? "?";
+
+        _logger.LogInformation(
+            "Exec in VM {VmName} by user {User}, timeout={Timeout}s, scriptLen={Len}, script={Preview}",
+            name, user, timeoutSeconds, request.Script.Length, scriptPreview
+        );
+
+        try
+        {
+            VmExecResult result = await _execService.ExecAsync(
+                name, request.Script, settings.DefaultVmUsername!,
+                settings.DefaultVmPassword!, timeoutSeconds
+            );
+            return Ok(new { exitCode = result.ExitCode, stdout = result.StdOut, stderr = result.StdErr });
+        }
+        catch (TimeoutException)
+        {
+            return StatusCode(504, new { error = $"Exec timed out after {timeoutSeconds}s." });
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Exec failed in VM {VmName}", name);
+            return StatusCode(502, new { error = "VM execution failed: " + ex.Message });
         }
     }
 
