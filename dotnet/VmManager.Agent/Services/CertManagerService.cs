@@ -160,7 +160,7 @@ public class CertManagerService : IHostedService, IDisposable
                 lastErr = e.Message;
             }
             if (attempt < MaxRetries - 1)
-                await Task.Delay(TimeSpan.FromSeconds(RetryBackoffBaseSec * Math.Pow(2, attempt)));
+                await Task.Delay(TimeSpan.FromSeconds(RetryBackoffBaseSec * Math.Pow(2, attempt) + Random.Shared.NextDouble()));
         }
 
         // Fallback to legacy /issue-cert endpoint via provider abstraction
@@ -195,43 +195,25 @@ public class CertManagerService : IHostedService, IDisposable
 
     private async Task FetchCrlAsync(AppSettings settings)
     {
-        string crlUrl = string.IsNullOrEmpty(settings.CrlUrl)
-            ? $"{settings.CertServerUrl.TrimEnd('/')}/crl.pem"
-            : settings.CrlUrl;
+        var provider = CertProviderFactory.Create(
+            settings.CertProvider,
+            settings.CertServerUrl,
+            settings.CertServerAuthToken,
+            settings.CaCertPath,
+            settings.CrlUrl,
+            _logger,
+            settings.StepCaTokenCommand
+        );
 
         string lastErr = "";
         for (int attempt = 0; attempt < MaxRetries; attempt++)
         {
             try
             {
-                using var handler = new HttpClientHandler();
-                if (File.Exists(settings.CaCertPath))
-                    handler.ServerCertificateCustomValidationCallback = (msg, cert, chain, errors) =>
-                    {
-                        if (errors == System.Net.Security.SslPolicyErrors.None)
-                            return true;
-                        try
-                        {
-                            using var caCert = new X509Certificate2(settings.CaCertPath);
-                            chain!.ChainPolicy.TrustMode = X509ChainTrustMode.CustomRootTrust;
-                            chain.ChainPolicy.CustomTrustStore.Add(caCert);
-                            chain.ChainPolicy.RevocationMode = X509RevocationMode.NoCheck;
-                            return chain.Build(cert!);
-                        }
-                        catch
-                        {
-                            return false;
-                        }
-                    };
-                else
-                    handler.ServerCertificateCustomValidationCallback = (_, _, _, _) => true;
-
-                using var client = new HttpClient(handler) { Timeout = TimeSpan.FromSeconds(10) };
-                HttpResponseMessage resp = await client.GetAsync(crlUrl);
-
-                if (resp.IsSuccessStatusCode)
+                string? crlPem = await provider.FetchCrlAsync();
+                if (crlPem != null)
                 {
-                    byte[] crlData = await resp.Content.ReadAsByteArrayAsync();
+                    byte[] crlData = System.Text.Encoding.UTF8.GetBytes(crlPem);
                     lock (_lock)
                     {
                         File.WriteAllBytes(settings.CrlPath, crlData);
@@ -240,17 +222,26 @@ public class CertManagerService : IHostedService, IDisposable
                     _logger.LogInformation("CertManagerService: fetched CRL ({Bytes} bytes)", crlData.Length);
                     return;
                 }
-                lastErr = $"HTTP {resp.StatusCode}";
+                lastErr = "provider returned null";
             }
             catch (Exception e)
             {
                 lastErr = e.Message;
             }
             if (attempt < MaxRetries - 1)
-                await Task.Delay(TimeSpan.FromSeconds(RetryBackoffBaseSec * Math.Pow(2, attempt)));
+                await Task.Delay(TimeSpan.FromSeconds(RetryBackoffBaseSec * Math.Pow(2, attempt) + Random.Shared.NextDouble()));
         }
         _logger.LogWarning("CertManagerService: failed to fetch CRL after {Retries} retries: {Error}",
             MaxRetries, lastErr);
+        if (!settings.FailOpenAllowed)
+        {
+            _logger.LogError("CertManagerService: fail-open not allowed, clearing CRL and marking invalid");
+            lock (_lock)
+            {
+                _crlBytes = null;
+            }
+            throw new InvalidOperationException($"CRL fetch failed and fail-open not allowed: {lastErr}");
+        }
     }
 
     private void LoadCaCertBytes()

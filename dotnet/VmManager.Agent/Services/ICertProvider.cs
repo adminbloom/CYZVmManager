@@ -405,6 +405,7 @@ public class StepCaCertProvider : ICertProvider
                 return trimmed;
             }
         }
+        _logger.LogWarning("StepCaCertProvider: no token command configured, using static auth_token as OTT (security risk)");
         return _authToken;
     }
 

@@ -64,4 +64,5 @@ public class AppSettings
     public bool RequireClientCert { get; set; }
     public string CertProvider { get; set; } = "fastapi";
     public string StepCaTokenCommand { get; set; } = "";
+    public bool FailOpenAllowed { get; set; } = true;
 }
