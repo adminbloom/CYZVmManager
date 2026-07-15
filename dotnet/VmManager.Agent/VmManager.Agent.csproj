@@ -9,6 +9,7 @@
     <PublishSingleFile>true</PublishSingleFile>
     <GenerateDocumentationFile>true</GenerateDocumentationFile>
     <NoWarn>$(NoWarn);1591</NoWarn>
+    <OutDir>..\..\..\dist\</OutDir>
   </PropertyGroup>
 
   <ItemGroup>

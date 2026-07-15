@@ -51,4 +51,17 @@ public class AppSettings
     public int StaleVmReminderDays { get; set; }
 
     public MonitoringSettings? Monitoring { get; set; }
+
+    public string CertServerUrl { get; set; } = "";
+    public string CertServerAuthToken { get; set; } = "";
+    public string ServerCertPath { get; set; } = @"C:\ProgramData\BloomCE\certs\agent_server_cert.pem";
+    public string ServerKeyPath { get; set; } = @"C:\ProgramData\BloomCE\certs\agent_server_key.pem";
+    public string CaCertPath { get; set; } = @"C:\ProgramData\BloomCE\certs\ca_cert.pem";
+    public string CrlPath { get; set; } = @"C:\ProgramData\BloomCE\certs\crl.pem";
+    public string CrlUrl { get; set; } = "";
+    public string ExpectedClientCN { get; set; } = "bloomce-client";
+    public bool EnableTls { get; set; }
+    public bool RequireClientCert { get; set; }
+    public string CertProvider { get; set; } = "fastapi";
+    public string StepCaTokenCommand { get; set; } = "";
 }

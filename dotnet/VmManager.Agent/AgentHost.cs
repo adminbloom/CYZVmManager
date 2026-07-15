@@ -1,3 +1,4 @@
+using System.Security.Cryptography.X509Certificates;
 using System.Text.Json;
 using Microsoft.AspNetCore.Authentication;
 using Microsoft.AspNetCore.Authorization;
@@ -29,41 +30,131 @@ public static class AgentHost
 
         int httpPort = builder.Configuration.GetValue("VmManager:HttpPort", 18275);
 
+        bool enableTls = builder.Configuration.GetValue("VmManager:EnableTls", false);
+        bool requireClientCert = builder.Configuration.GetValue("VmManager:RequireClientCert", false);
+        string? certServerUrl = builder.Configuration.GetValue<string>("VmManager:CertServerUrl");
+
         builder.WebHost.ConfigureKestrel(kestrel =>
         {
-            kestrel.ListenAnyIP(
-                httpPort,
-                listenOptions =>
+            if (enableTls && !string.IsNullOrEmpty(certServerUrl))
+            {
+                string defaultCertDir = Path.Combine(
+                    Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData),
+                    "BloomCE", "certs"
+                );
+                string serverCertPath = builder.Configuration.GetValue("VmManager:ServerCertPath",
+                    Path.Combine(defaultCertDir, "agent_server_cert.pem"));
+                string serverKeyPath = builder.Configuration.GetValue("VmManager:ServerKeyPath",
+                    Path.Combine(defaultCertDir, "agent_server_key.pem"));
+                string caCertPath = builder.Configuration.GetValue("VmManager:CaCertPath",
+                    Path.Combine(defaultCertDir, "ca_cert.pem"));
+
                 {
-                    listenOptions.Use(next =>
-                        async context =>
+                    kestrel.ListenAnyIP(
+                        httpPort,
+                        listenOptions =>
                         {
-                            System.IO.Pipelines.PipeReader input = context.Transport.Input;
-                            System.IO.Pipelines.ReadResult result = await input.ReadAsync(
-                                context.ConnectionClosed
-                            );
-                            System.Buffers.ReadOnlySequence<byte> buffer = result.Buffer;
-
-                            if (buffer.Length > 0 && buffer.First.Span[0] == 0x03)
+                            // Deferred cert loading: read cert at connection time so it works
+                            // even if CertManagerService fetches it after Kestrel starts.
+                            listenOptions.UseHttps(options =>
                             {
-                                input.AdvanceTo(buffer.Start);
-                                DuplexPipeStream stream = new DuplexPipeStream(
-                                    input,
-                                    context.Transport.Output
-                                );
-                                await rdpHandler!.HandleConnectionAsync(
-                                    stream,
-                                    context.ConnectionClosed
-                                );
-                                return;
+                                options.ServerCertificateSelector = (_, _) =>
+                                {
+                                    if (File.Exists(serverCertPath) && File.Exists(serverKeyPath))
+                                    {
+                                        return X509Certificate2.CreateFromPemFile(serverCertPath, serverKeyPath);
+                                    }
+                                    Log.Warning("AgentHost: server cert not yet available at {CertPath}", serverCertPath);
+                                    return null;
+                                };
+                            });
+                            if (requireClientCert)
+                            {
+                                string expectedCn = builder.Configuration.GetValue("VmManager:ExpectedClientCN", "bloomce-client");
+                                ((Microsoft.AspNetCore.Builder.IApplicationBuilder)listenOptions).Use(next =>
+                                    {
+                                        return async context =>
+                                        {
+                                            var clientCert = await context.Connection.GetClientCertificateAsync();
+                                            if (clientCert == null)
+                                            {
+                                                context.Response.StatusCode = 403;
+                                                return;
+                                            }
+                                            if (!File.Exists(caCertPath))
+                                            {
+                                                context.Response.StatusCode = 503;
+                                                return;
+                                            }
+                                            using var caCert = new X509Certificate2(caCertPath);
+                                            using var chain = new X509Chain();
+                                            chain.ChainPolicy.TrustMode = X509ChainTrustMode.CustomRootTrust;
+                                            chain.ChainPolicy.CustomTrustStore.Add(caCert);
+                                            string crlPath = builder.Configuration.GetValue("VmManager:CrlPath",
+                                                Path.Combine(defaultCertDir, "crl.pem"));
+                                            if (File.Exists(crlPath))
+                                            {
+                                                chain.ChainPolicy.RevocationMode = X509RevocationMode.Offline;
+                                            }
+                                            else
+                                            {
+                                                chain.ChainPolicy.RevocationMode = X509RevocationMode.NoCheck;
+                                            }
+                                            if (!chain.Build(clientCert))
+                                            {
+                                                context.Response.StatusCode = 403;
+                                                return;
+                                            }
+                                            // Validate CN matches expected client CN
+                                            string certCn = clientCert.GetNameInfo(X509NameType.SimpleName, false) ?? "";
+                                            if (!string.IsNullOrEmpty(expectedCn) &&
+                                                !certCn.Equals(expectedCn, StringComparison.OrdinalIgnoreCase))
+                                            {
+                                                Log.Warning("AgentHost: client cert CN mismatch: expected={Expected}, got={Actual}", expectedCn, certCn);
+                                                context.Response.StatusCode = 403;
+                                                return;
+                                            }
+                                            await next(context);
+                                        };
+                                    });
                             }
+                            listenOptions.Use(next =>
+                                async context =>
+                                {
+                                    System.IO.Pipelines.PipeReader input = context.Transport.Input;
+                                    System.IO.Pipelines.ReadResult result = await input.ReadAsync(
+                                        context.ConnectionClosed
+                                    );
+                                    System.Buffers.ReadOnlySequence<byte> buffer = result.Buffer;
 
-                            input.AdvanceTo(buffer.Start);
-                            await next(context);
+                                    if (buffer.Length > 0 && buffer.First.Span[0] == 0x03)
+                                    {
+                                        input.AdvanceTo(buffer.Start);
+                                        DuplexPipeStream stream = new DuplexPipeStream(
+                                            input,
+                                            context.Transport.Output
+                                        );
+                                        await rdpHandler!.HandleConnectionAsync(
+                                            stream,
+                                            context.ConnectionClosed
+                                        );
+                                        return;
+                                    }
+
+                                    input.AdvanceTo(buffer.Start);
+                                    await next(context);
+                                }
+                            );
                         }
                     );
+                    Log.Information("AgentHost: HTTPS enabled on port {Port} with client cert validation={RequireClient}, expectedCN={ExpectedCn}",
+                        httpPort, requireClientCert, builder.Configuration.GetValue("VmManager:ExpectedClientCN", "bloomce-client"));
                 }
-            );
+            }
+            else
+            {
+                ConfigureHttpListener(kestrel, httpPort, rdpHandler);
+            }
         });
 
         Log.Information("AgentHost: configuring services");
@@ -206,6 +297,43 @@ public static class AgentHost
         Task runTask = app.RunAsync();
         cancellationToken.Register(() => app.StopAsync().GetAwaiter().GetResult());
         await runTask;
+    }
+
+    private static void ConfigureHttpListener(Microsoft.AspNetCore.Server.Kestrel.Core.KestrelServerOptions kestrel, int httpPort, RdpCredSspConnectionHandler? rdpHandler)
+    {
+        kestrel.ListenAnyIP(
+            httpPort,
+            listenOptions =>
+            {
+                listenOptions.Use(next =>
+                    async context =>
+                    {
+                        System.IO.Pipelines.PipeReader input = context.Transport.Input;
+                        System.IO.Pipelines.ReadResult result = await input.ReadAsync(
+                            context.ConnectionClosed
+                        );
+                        System.Buffers.ReadOnlySequence<byte> buffer = result.Buffer;
+
+                        if (buffer.Length > 0 && buffer.First.Span[0] == 0x03)
+                        {
+                            input.AdvanceTo(buffer.Start);
+                            DuplexPipeStream stream = new DuplexPipeStream(
+                                input,
+                                context.Transport.Output
+                            );
+                            await rdpHandler!.HandleConnectionAsync(
+                                stream,
+                                context.ConnectionClosed
+                            );
+                            return;
+                        }
+
+                        input.AdvanceTo(buffer.Start);
+                        await next(context);
+                    }
+                );
+            }
+        );
     }
 
     private static string? ReadVmBackendFromSettings()

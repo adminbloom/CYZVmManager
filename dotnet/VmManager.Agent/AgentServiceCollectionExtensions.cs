@@ -1,3 +1,4 @@
+using Microsoft.Extensions.Hosting;
 using VmManager.Agent.Services;
 using VmManager.Agent.Services.Monitoring;
 using VmManager.Agent.Services.Monitoring.Checks;
@@ -90,6 +91,8 @@ public static class AgentServiceCollectionExtensions
         services.AddSingleton<EmailService>();
         services.AddSingleton<QuotaService>();
         services.AddHostedService<StaleVmReminderService>();
+        services.AddSingleton<CertManagerService>();
+        services.AddHostedService(sp => sp.GetRequiredService<CertManagerService>());
 
         services.AddSingleton<AlertStore>();
         services.AddSingleton<AlertNotifier>();

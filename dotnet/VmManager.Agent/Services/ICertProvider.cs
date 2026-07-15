@@ -1,0 +1,553 @@
+using System.Diagnostics;
+using System.Security.Cryptography;
+using System.Security.Cryptography.X509Certificates;
+
+namespace VmManager.Agent.Services;
+
+public interface ICertProvider
+{
+    Task<SignCsrResult> SignCsrAsync(string csrPem, List<string>? sanIps = null, List<string>? sanDns = null);
+    Task<GetCertResult> GetCertAsync(string commonName);
+    Task<RenewCertResult> RenewCertAsync(string certPem, string keyPem);
+    Task<string?> FetchCrlAsync();
+    Task<string?> FetchCaCertAsync();
+}
+
+public class RenewCertResult
+{
+    public string CertPem { get; set; } = "";
+    public string Expiry { get; set; } = "";
+    public bool Valid => !string.IsNullOrEmpty(CertPem);
+}
+
+public class SignCsrResult
+{
+    public string CertPem { get; set; } = "";
+    public string Expiry { get; set; } = "";
+    public bool Valid => !string.IsNullOrEmpty(CertPem);
+}
+
+public class GetCertResult
+{
+    public string CertPem { get; set; } = "";
+    public string KeyPem { get; set; } = "";
+    public string Expiry { get; set; } = "";
+    public bool Valid => !string.IsNullOrEmpty(CertPem) && !string.IsNullOrEmpty(KeyPem);
+}
+
+public class FastApiCertProvider : ICertProvider
+{
+    private readonly string _baseUrl;
+    private readonly string _authToken;
+    private readonly string _caCertPath;
+    private readonly string _crlUrl;
+    private readonly ILogger _logger;
+
+    public FastApiCertProvider(string certServerUrl, string authToken, string caCertPath, string crlUrl, ILogger logger)
+    {
+        _baseUrl = CertProviderFactory.StripUrlPath(certServerUrl);
+        _authToken = authToken;
+        _caCertPath = caCertPath;
+        _crlUrl = string.IsNullOrEmpty(crlUrl) ? $"{_baseUrl}/crl.pem" : crlUrl;
+        _logger = logger;
+    }
+
+    public async Task<SignCsrResult> SignCsrAsync(string csrPem, List<string>? sanIps = null, List<string>? sanDns = null)
+    {
+        var payload = new Dictionary<string, object> { ["csr_pem"] = csrPem };
+        if (sanIps != null && sanIps.Count > 0)
+            payload["san_ips"] = sanIps;
+        if (sanDns != null && sanDns.Count > 0)
+            payload["san_dns"] = sanDns;
+
+        using var handler = CreateHandler();
+        using var client = new HttpClient(handler) { Timeout = TimeSpan.FromSeconds(10) };
+        client.DefaultRequestHeaders.Authorization =
+            new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", _authToken);
+
+        var content = new StringContent(
+            System.Text.Json.JsonSerializer.Serialize(payload),
+            System.Text.Encoding.UTF8,
+            "application/json"
+        );
+
+        HttpResponseMessage resp = await client.PostAsync($"{_baseUrl}/sign-csr", content);
+        if (resp.IsSuccessStatusCode)
+        {
+            string body = await resp.Content.ReadAsStringAsync();
+            using var doc = System.Text.Json.JsonDocument.Parse(body);
+            return new SignCsrResult
+            {
+                CertPem = doc.RootElement.GetProperty("cert_pem").GetString() ?? "",
+                Expiry = doc.RootElement.TryGetProperty("expiry", out var exp) ? exp.GetString() ?? "" : ""
+            };
+        }
+
+        _logger.LogError("FastApiCertProvider: sign_csr failed: HTTP {Status}", resp.StatusCode);
+        return new SignCsrResult();
+    }
+
+    public async Task<GetCertResult> GetCertAsync(string commonName)
+    {
+        using var handler = CreateHandler();
+        using var client = new HttpClient(handler) { Timeout = TimeSpan.FromSeconds(10) };
+        client.DefaultRequestHeaders.Authorization =
+            new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", _authToken);
+
+        var content = new StringContent(
+            System.Text.Json.JsonSerializer.Serialize(new { cn = commonName }),
+            System.Text.Encoding.UTF8, "application/json");
+        HttpResponseMessage resp = await client.PostAsync($"{_baseUrl}/issue-cert", content);
+
+        if (resp.IsSuccessStatusCode)
+        {
+            string body = await resp.Content.ReadAsStringAsync();
+            using var doc = System.Text.Json.JsonDocument.Parse(body);
+            return new GetCertResult
+            {
+                CertPem = doc.RootElement.GetProperty("cert_pem").GetString() ?? "",
+                KeyPem = doc.RootElement.GetProperty("key_pem").GetString() ?? "",
+                Expiry = doc.RootElement.TryGetProperty("expiry", out var exp) ? exp.GetString() ?? "" : ""
+            };
+        }
+
+        _logger.LogError("FastApiCertProvider: get_cert failed: HTTP {Status}", resp.StatusCode);
+        return new GetCertResult();
+    }
+
+    public Task<RenewCertResult> RenewCertAsync(string certPem, string keyPem)
+    {
+        throw new NotImplementedException("FastAPI cert server does not support mTLS renewal");
+    }
+
+    public async Task<string?> FetchCrlAsync()
+    {
+        try
+        {
+            using var handler = CreateHandler();
+            using var client = new HttpClient(handler) { Timeout = TimeSpan.FromSeconds(10) };
+            HttpResponseMessage resp = await client.GetAsync(_crlUrl);
+            if (resp.IsSuccessStatusCode)
+                return await resp.Content.ReadAsStringAsync();
+        }
+        catch (Exception e)
+        {
+            _logger.LogWarning("FastApiCertProvider: fetch_crl failed: {Error}", e.Message);
+        }
+        return null;
+    }
+
+    public async Task<string?> FetchCaCertAsync()
+    {
+        try
+        {
+            using var handler = CreateHandler();
+            using var client = new HttpClient(handler) { Timeout = TimeSpan.FromSeconds(10) };
+            HttpResponseMessage resp = await client.GetAsync($"{_baseUrl}/ca.crt");
+            if (resp.IsSuccessStatusCode)
+                return await resp.Content.ReadAsStringAsync();
+        }
+        catch (Exception e)
+        {
+            _logger.LogWarning("FastApiCertProvider: fetch_ca_cert failed: {Error}", e.Message);
+        }
+        return null;
+    }
+
+    private HttpClientHandler CreateHandler()
+    {
+        var handler = new HttpClientHandler();
+        if (File.Exists(_caCertPath))
+            handler.ServerCertificateCustomValidationCallback = (msg, cert, chain, errors) =>
+            {
+                if (errors == System.Net.Security.SslPolicyErrors.None)
+                    return true;
+                try
+                {
+                    using var caCert = new X509Certificate2(_caCertPath);
+                    chain!.ChainPolicy.TrustMode = X509ChainTrustMode.CustomRootTrust;
+                    chain.ChainPolicy.CustomTrustStore.Add(caCert);
+                    chain.ChainPolicy.RevocationMode = X509RevocationMode.NoCheck;
+                    return chain.Build(cert!);
+                }
+                catch
+                {
+                    return false;
+                }
+            };
+        else
+            handler.ServerCertificateCustomValidationCallback = (_, _, _, _) => true;
+        return handler;
+    }
+}
+
+public class StepCaCertProvider : ICertProvider
+{
+    private readonly string _baseUrl;
+    private readonly string _authToken;
+    private readonly string _caCertPath;
+    private readonly string _crlUrl;
+    private readonly string _tokenCommand;
+    private readonly ILogger _logger;
+
+    public StepCaCertProvider(string certServerUrl, string authToken, string caCertPath,
+        string crlUrl, string tokenCommand, ILogger logger)
+    {
+        _baseUrl = CertProviderFactory.StripUrlPath(certServerUrl);
+        _authToken = authToken;
+        _caCertPath = caCertPath;
+        _crlUrl = string.IsNullOrEmpty(crlUrl) ? $"{_baseUrl}/crl" : crlUrl;
+        _tokenCommand = tokenCommand ?? "";
+        _logger = logger;
+    }
+
+    /// <summary>
+    /// Bootstrap phase: POST /sign with a one-time token (OTT).
+    /// The OTT is obtained by running the configured token command (e.g. 'step ca token').
+    /// step-ca expects the JWT as 'ott' in the JSON body, not in the Authorization header.
+    /// </summary>
+    public async Task<SignCsrResult> SignCsrAsync(string csrPem, List<string>? sanIps = null, List<string>? sanDns = null)
+    {
+        try
+        {
+            string ott = await GetFreshTokenAsync();
+
+            var payload = new Dictionary<string, object> { ["csr"] = csrPem, ["ott"] = ott };
+
+            using var handler = CreateHandler();
+            using var client = new HttpClient(handler) { Timeout = TimeSpan.FromSeconds(15) };
+
+            var content = new StringContent(
+                System.Text.Json.JsonSerializer.Serialize(payload),
+                System.Text.Encoding.UTF8, "application/json");
+
+            HttpResponseMessage resp = await client.PostAsync($"{_baseUrl}/sign", content);
+            if (resp.IsSuccessStatusCode)
+            {
+                string body = await resp.Content.ReadAsStringAsync();
+                string certPem = ExtractCertPem(body);
+                if (string.IsNullOrEmpty(certPem))
+                {
+                    _logger.LogError("StepCaCertProvider: /sign response did not contain a certificate");
+                    return new SignCsrResult();
+                }
+                string expiry = ExtractExpiry(certPem);
+                return new SignCsrResult { CertPem = certPem, Expiry = expiry };
+            }
+
+            _logger.LogError("StepCaCertProvider: /sign failed: HTTP {Status}", resp.StatusCode);
+        }
+        catch (Exception e)
+        {
+            _logger.LogError("StepCaCertProvider: /sign exception: {Error}", e.Message);
+        }
+        return new SignCsrResult();
+    }
+
+    /// <summary>
+    /// Renewal phase: POST /renew using mTLS client certificate authentication.
+    /// No token is needed - the existing client cert authenticates the request.
+    /// Returns a renewed certificate for the same subject and SANs.
+    /// </summary>
+    public async Task<RenewCertResult> RenewCertAsync(string certPem, string keyPem)
+    {
+        string? certFile = null;
+        string? keyFile = null;
+        try
+        {
+            using var handler = CreateMtlsHandler(certPem, keyPem, out certFile, out keyFile);
+            using var client = new HttpClient(handler) { Timeout = TimeSpan.FromSeconds(15) };
+
+            var content = new StringContent("{}", System.Text.Encoding.UTF8, "application/json");
+            HttpResponseMessage resp = await client.PostAsync($"{_baseUrl}/renew", content);
+
+            if (resp.IsSuccessStatusCode)
+            {
+                string body = await resp.Content.ReadAsStringAsync();
+                string renewedCertPem = ExtractCertPem(body);
+                if (string.IsNullOrEmpty(renewedCertPem))
+                {
+                    _logger.LogError("StepCaCertProvider: /renew response did not contain a certificate");
+                    return new RenewCertResult();
+                }
+                string expiry = ExtractExpiry(renewedCertPem);
+                _logger.LogInformation("StepCaCertProvider: cert renewed via mTLS /renew, expiry={Expiry}", expiry);
+                return new RenewCertResult { CertPem = renewedCertPem, Expiry = expiry };
+            }
+
+            _logger.LogWarning("StepCaCertProvider: /renew failed: HTTP {Status}", resp.StatusCode);
+        }
+        catch (Exception e)
+        {
+            _logger.LogWarning("StepCaCertProvider: /renew exception: {Error}", e.Message);
+        }
+        finally
+        {
+            if (certFile != null)
+            {
+                try { File.Delete(certFile); } catch { }
+            }
+            if (keyFile != null)
+            {
+                try { File.Delete(keyFile); } catch { }
+            }
+        }
+        return new RenewCertResult();
+    }
+
+    /// <summary>
+    /// Generate a keypair + CSR locally, then sign via /sign (bootstrap phase).
+    /// The private key never leaves the caller.
+    /// </summary>
+    public async Task<GetCertResult> GetCertAsync(string commonName)
+    {
+        var sanIps = CertProviderFactory.GetAgentLanIps();
+        var sanDns = new List<string> { commonName };
+        var (csrPem, keyPem) = CertProviderFactory.GenerateCsr(commonName, sanIps: sanIps, sanDns: sanDns);
+        var result = await SignCsrAsync(csrPem, sanIps: sanIps, sanDns: sanDns);
+        if (result.Valid)
+        {
+            return new GetCertResult { CertPem = result.CertPem, KeyPem = keyPem, Expiry = result.Expiry };
+        }
+        return new GetCertResult();
+    }
+
+    /// <summary>
+    /// Fetch CRL from step-ca. step-ca does not enable a CRL endpoint by default.
+    /// Returns an empty string on 404 (no revoked certs).
+    /// </summary>
+    public async Task<string?> FetchCrlAsync()
+    {
+        try
+        {
+            using var handler = CreateHandler();
+            using var client = new HttpClient(handler) { Timeout = TimeSpan.FromSeconds(10) };
+            HttpResponseMessage resp = await client.GetAsync(_crlUrl);
+            if (resp.IsSuccessStatusCode)
+                return await resp.Content.ReadAsStringAsync();
+            if (resp.StatusCode == System.Net.HttpStatusCode.NotFound)
+            {
+                _logger.LogInformation("StepCaCertProvider: CRL endpoint not configured (404), returning empty CRL");
+                return "";
+            }
+            _logger.LogWarning("StepCaCertProvider: fetch_crl failed: HTTP {Status}", resp.StatusCode);
+        }
+        catch (Exception e)
+        {
+            _logger.LogWarning("StepCaCertProvider: fetch_crl exception: {Error}", e.Message);
+        }
+        return null;
+    }
+
+    /// <summary>
+    /// Fetch root CA cert. step-ca exposes root certs at /roots.pem (PEM bundle).
+    /// Falls back to local file at _caCertPath.
+    /// </summary>
+    public async Task<string?> FetchCaCertAsync()
+    {
+        if (File.Exists(_caCertPath))
+        {
+            try { return File.ReadAllText(_caCertPath); }
+            catch { /* fall through to network fetch */ }
+        }
+
+        try
+        {
+            using var handler = CreateHandler();
+            using var client = new HttpClient(handler) { Timeout = TimeSpan.FromSeconds(10) };
+            HttpResponseMessage resp = await client.GetAsync($"{_baseUrl}/roots.pem");
+            if (resp.IsSuccessStatusCode)
+            {
+                string pem = await resp.Content.ReadAsStringAsync();
+                if (pem.Contains("BEGIN CERTIFICATE"))
+                    return pem;
+            }
+            _logger.LogWarning("StepCaCertProvider: fetch_ca_cert failed: HTTP {Status}", resp.StatusCode);
+        }
+        catch (Exception e)
+        {
+            _logger.LogWarning("StepCaCertProvider: fetch_ca_cert exception: {Error}", e.Message);
+        }
+        return null;
+    }
+
+    /// <summary>
+    /// Run the configured token command to obtain a fresh JWT (one-time token).
+    /// Falls back to _authToken if no command is configured.
+    /// </summary>
+    private async Task<string> GetFreshTokenAsync()
+    {
+        if (!string.IsNullOrEmpty(_tokenCommand))
+        {
+            var psi = new ProcessStartInfo
+            {
+                FileName = "cmd.exe",
+                Arguments = $"/c {_tokenCommand}",
+                UseShellExecute = false,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                CreateNoWindow = true
+            };
+            using var proc = Process.Start(psi);
+            if (proc != null)
+            {
+                string output = await proc.StandardOutput.ReadToEndAsync();
+                await proc.WaitForExitAsync();
+                string trimmed = output.Trim();
+                foreach (var line in trimmed.Split('\n'))
+                {
+                    var l = line.Trim();
+                    if (l.StartsWith("eyJ"))
+                        return l;
+                }
+                if (trimmed.StartsWith("eyJ"))
+                    return trimmed;
+                return trimmed;
+            }
+        }
+        return _authToken;
+    }
+
+    private static string ExtractCertPem(string body)
+    {
+        try
+        {
+            using var doc = System.Text.Json.JsonDocument.Parse(body);
+            if (doc.RootElement.TryGetProperty("crt", out var crt))
+                return crt.GetString() ?? "";
+            if (doc.RootElement.TryGetProperty("cert", out var cert))
+                return cert.GetString() ?? "";
+            if (doc.RootElement.TryGetProperty("cert_pem", out var cp))
+                return cp.GetString() ?? "";
+        }
+        catch { }
+        if (body.Contains("BEGIN CERTIFICATE"))
+            return body;
+        return "";
+    }
+
+    private static string ExtractExpiry(string certPem)
+    {
+        try
+        {
+            using var cert = new X509Certificate2(System.Text.Encoding.ASCII.GetBytes(certPem));
+            return cert.NotAfter.ToString("o");
+        }
+        catch { return ""; }
+    }
+
+    private HttpClientHandler CreateHandler()
+    {
+        var handler = new HttpClientHandler();
+        if (File.Exists(_caCertPath))
+            handler.ServerCertificateCustomValidationCallback = (msg, cert, chain, errors) =>
+            {
+                if (errors == System.Net.Security.SslPolicyErrors.None)
+                    return true;
+                try
+                {
+                    using var caCert = new X509Certificate2(_caCertPath);
+                    chain!.ChainPolicy.TrustMode = X509ChainTrustMode.CustomRootTrust;
+                    chain.ChainPolicy.CustomTrustStore.Add(caCert);
+                    chain.ChainPolicy.RevocationMode = X509RevocationMode.NoCheck;
+                    return chain.Build(cert!);
+                }
+                catch { return false; }
+            };
+        else
+            handler.ServerCertificateCustomValidationCallback = (_, _, _, _) => true;
+        return handler;
+    }
+
+    /// <summary>
+    /// Create an HttpClientHandler configured for mTLS client certificate authentication.
+    /// Used for the /renew endpoint which authenticates via the existing client cert.
+    /// </summary>
+    private HttpClientHandler CreateMtlsHandler(string certPem, string keyPem,
+        out string certFilePath, out string keyFilePath)
+    {
+        var handler = CreateHandler();
+
+        var tempDir = Path.Combine(Path.GetTempPath(), "bloomce_certs");
+        Directory.CreateDirectory(tempDir);
+        certFilePath = Path.Combine(tempDir, "stepca_renew_cert.pem");
+        keyFilePath = Path.Combine(tempDir, "stepca_renew_key.pem");
+        File.WriteAllText(certFilePath, certPem);
+        File.WriteAllText(keyFilePath, keyPem);
+
+        handler.ClientCertificateOptions = ClientCertificateOption.Manual;
+        handler.ClientCertificates.Add(X509Certificate2.CreateFromPemFile(certFilePath, keyFilePath));
+
+        return handler;
+    }
+}
+
+public static class CertProviderFactory
+{
+    public static string StripUrlPath(string url)
+    {
+        var trimmed = url.TrimEnd('/');
+        var schemePos = trimmed.IndexOf("://");
+        if (schemePos < 0) return trimmed;
+        var hostStart = schemePos + 3;
+        var pathPos = trimmed.IndexOf('/', hostStart);
+        return pathPos >= 0 ? trimmed[..pathPos] : trimmed;
+    }
+
+    public static ICertProvider Create(string providerName, string certServerUrl,
+        string authToken, string caCertPath, string crlUrl, ILogger logger,
+        string stepCaTokenCommand = "")
+    {
+        var name = providerName.ToLower().Trim();
+        if (name == "fastapi")
+            return new FastApiCertProvider(certServerUrl, authToken, caCertPath, crlUrl, logger);
+        if (name == "step-ca")
+            return new StepCaCertProvider(certServerUrl, authToken, caCertPath, crlUrl,
+                stepCaTokenCommand, logger);
+        throw new ArgumentException($"Unknown cert provider: {providerName}");
+    }
+
+    public static (string csrPem, string keyPem) GenerateCsr(string commonName, List<string>? sanIps = null, List<string>? sanDns = null)
+    {
+        using var rsa = RSA.Create(2048);
+        var req = new CertificateRequest(
+            $"CN={commonName}", rsa, HashAlgorithmName.SHA256, RSASignaturePadding.Pkcs1);
+
+        if (sanIps != null || sanDns != null)
+        {
+            var sanBuilder = new SubjectAlternativeNameBuilder();
+            if (sanDns != null)
+                foreach (var dns in sanDns)
+                    sanBuilder.AddDnsName(dns);
+            if (sanIps != null)
+                foreach (var ip in sanIps)
+                    if (System.Net.IPAddress.TryParse(ip, out var addr))
+                        sanBuilder.AddIpAddress(addr);
+            req.CertificateExtensions.Add(sanBuilder.Build());
+        }
+
+        string csrPem = req.CreateSigningRequestPem();
+        string keyPem = rsa.ExportPkcs8PrivateKeyPem();
+        return (csrPem, keyPem);
+    }
+
+    public static List<string> GetAgentLanIps()
+    {
+        var ips = new List<string>();
+        try
+        {
+            var host = System.Net.Dns.GetHostEntry(System.Net.Dns.GetHostName());
+            foreach (var addr in host.AddressList)
+            {
+                if (addr.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork)
+                {
+                    string ipStr = addr.ToString();
+                    if (!ipStr.StartsWith("127.") && !ipStr.StartsWith("169.254."))
+                        ips.Add(ipStr);
+                }
+            }
+        }
+        catch { }
+        return ips;
+    }
+}
