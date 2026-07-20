@@ -167,7 +167,7 @@ public class FastApiCertProvider : ICertProvider
                     using var caCert = new X509Certificate2(_caCertPath);
                     chain!.ChainPolicy.TrustMode = X509ChainTrustMode.CustomRootTrust;
                     chain.ChainPolicy.CustomTrustStore.Add(caCert);
-                    chain.ChainPolicy.RevocationMode = X509RevocationMode.NoCheck;
+                    chain.ChainPolicy.RevocationMode = X509RevocationMode.Online;
                     return chain.Build(cert!);
                 }
                 catch
@@ -450,7 +450,7 @@ public class StepCaCertProvider : ICertProvider
                     using var caCert = new X509Certificate2(_caCertPath);
                     chain!.ChainPolicy.TrustMode = X509ChainTrustMode.CustomRootTrust;
                     chain.ChainPolicy.CustomTrustStore.Add(caCert);
-                    chain.ChainPolicy.RevocationMode = X509RevocationMode.NoCheck;
+                    chain.ChainPolicy.RevocationMode = X509RevocationMode.Online;
                     return chain.Build(cert!);
                 }
                 catch { return false; }
@@ -510,9 +510,9 @@ public static class CertProviderFactory
 
     public static (string csrPem, string keyPem) GenerateCsr(string commonName, List<string>? sanIps = null, List<string>? sanDns = null)
     {
-        using var rsa = RSA.Create(2048);
+        using var ecd = ECDsa.Create(ECCurve.CreateFromValue("1.2.840.10045.3.1.7")); // P-256
         var req = new CertificateRequest(
-            $"CN={commonName}", rsa, HashAlgorithmName.SHA256, RSASignaturePadding.Pkcs1);
+            $"CN={commonName}", ecd, HashAlgorithmName.SHA256);
 
         if (sanIps != null || sanDns != null)
         {
@@ -528,7 +528,7 @@ public static class CertProviderFactory
         }
 
         string csrPem = req.CreateSigningRequestPem();
-        string keyPem = rsa.ExportPkcs8PrivateKeyPem();
+        string keyPem = ecd.ExportPkcs8PrivateKeyPem();
         return (csrPem, keyPem);
     }
 
