@@ -56,6 +56,8 @@ public class CertManagerService : IHostedService, IDisposable
             return;
         }
 
+        await EnsureCaCertAsync(settings);
+
         bool certOk = await FetchCertAsync(settings);
         if (!certOk)
         {
@@ -89,6 +91,50 @@ public class CertManagerService : IHostedService, IDisposable
         _crlTimer?.Change(Timeout.Infinite, 0);
         _logger.LogInformation("CertManagerService stopped");
         await Task.CompletedTask;
+    }
+
+    private async Task EnsureCaCertAsync(AppSettings settings)
+    {
+        if (File.Exists(settings.CaCertPath) && new FileInfo(settings.CaCertPath).Length > 0)
+        {
+            LoadCaCertBytes();
+            return;
+        }
+
+        var provider = CertProviderFactory.Create(
+            settings.CertProvider,
+            settings.CertServerUrl,
+            settings.CertServerAuthToken,
+            settings.CaCertPath,
+            settings.CrlUrl,
+            _logger,
+            settings.StepCaTokenCommand
+        );
+
+        try
+        {
+            string? caPem = await provider.FetchCaCertAsync();
+            if (!string.IsNullOrWhiteSpace(caPem))
+            {
+                Directory.CreateDirectory(Path.GetDirectoryName(settings.CaCertPath)!);
+                File.WriteAllText(settings.CaCertPath, caPem);
+                lock (_lock)
+                    _caCertBytes = System.Text.Encoding.UTF8.GetBytes(caPem);
+                _logger.LogInformation("CertManagerService: downloaded CA cert to {Path}", settings.CaCertPath);
+                return;
+            }
+        }
+        catch (Exception e)
+        {
+            _logger.LogWarning("CertManagerService: CA download failed: {Error}", e.Message);
+        }
+
+        if (!File.Exists(settings.CaCertPath))
+        {
+            throw new InvalidOperationException(
+                $"CA cert missing at {settings.CaCertPath} and download from cert server failed"
+            );
+        }
     }
 
     private async Task<bool> FetchCertAsync(AppSettings settings)

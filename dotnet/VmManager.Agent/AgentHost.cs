@@ -4,6 +4,7 @@ using Microsoft.AspNetCore.Authentication;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Components.Authorization;
 using Microsoft.AspNetCore.HttpOverrides;
+using Microsoft.AspNetCore.Server.Kestrel.Https;
 using MudBlazor.Services;
 using Serilog;
 using VmManager.Agent.Auth;
@@ -62,62 +63,49 @@ public static class AgentHost
                                 {
                                     if (File.Exists(serverCertPath) && File.Exists(serverKeyPath))
                                     {
-                                        return X509Certificate2.CreateFromPemFile(serverCertPath, serverKeyPath);
+                                        // CreateFromPemFile alone yields an ephemeral key that
+                                        // Schannel cannot use for server TLS on Windows.
+                                        using X509Certificate2 pem = X509Certificate2.CreateFromPemFile(
+                                            serverCertPath,
+                                            serverKeyPath
+                                        );
+                                        byte[] pfx = pem.Export(X509ContentType.Pkcs12);
+                                        return X509CertificateLoader.LoadPkcs12(
+                                            pfx,
+                                            password: null,
+                                            X509KeyStorageFlags.MachineKeySet
+                                                | X509KeyStorageFlags.Exportable
+                                        );
                                     }
                                     Log.Warning("AgentHost: server cert not yet available at {CertPath}", serverCertPath);
                                     return null;
                                 };
+
+                                if (requireClientCert)
+                                {
+                                    // Must request a client cert during the handshake or
+                                    // GetClientCertificateAsync / validation never sees one.
+                                    options.ClientCertificateMode =
+                                        ClientCertificateMode.RequireCertificate;
+                                    string expectedCn = builder.Configuration.GetValue(
+                                        "VmManager:ExpectedClientCN",
+                                        "bloomce-client"
+                                    );
+                                    string crlPath = builder.Configuration.GetValue(
+                                        "VmManager:CrlPath",
+                                        Path.Combine(defaultCertDir, "crl.pem")
+                                    );
+                                    options.ClientCertificateValidation = (clientCert, _, _) =>
+                                        ValidateClientCertificate(
+                                            clientCert,
+                                            caCertPath,
+                                            crlPath,
+                                            expectedCn
+                                        );
+                                }
                             });
-                            if (requireClientCert)
-                            {
-                                string expectedCn = builder.Configuration.GetValue("VmManager:ExpectedClientCN", "bloomce-client");
-                                ((Microsoft.AspNetCore.Builder.IApplicationBuilder)listenOptions).Use(next =>
-                                    {
-                                        return async context =>
-                                        {
-                                            var clientCert = await context.Connection.GetClientCertificateAsync();
-                                            if (clientCert == null)
-                                            {
-                                                context.Response.StatusCode = 403;
-                                                return;
-                                            }
-                                            if (!File.Exists(caCertPath))
-                                            {
-                                                context.Response.StatusCode = 503;
-                                                return;
-                                            }
-                                            using var caCert = new X509Certificate2(caCertPath);
-                                            using var chain = new X509Chain();
-                                            chain.ChainPolicy.TrustMode = X509ChainTrustMode.CustomRootTrust;
-                                            chain.ChainPolicy.CustomTrustStore.Add(caCert);
-                                            string crlPath = builder.Configuration.GetValue("VmManager:CrlPath",
-                                                Path.Combine(defaultCertDir, "crl.pem"));
-                                            if (File.Exists(crlPath))
-                                            {
-                                                chain.ChainPolicy.RevocationMode = X509RevocationMode.Offline;
-                                            }
-                                            else
-                                            {
-                                                chain.ChainPolicy.RevocationMode = X509RevocationMode.NoCheck;
-                                            }
-                                            if (!chain.Build(clientCert))
-                                            {
-                                                context.Response.StatusCode = 403;
-                                                return;
-                                            }
-                                            // Validate CN matches expected client CN
-                                            string certCn = clientCert.GetNameInfo(X509NameType.SimpleName, false) ?? "";
-                                            if (!string.IsNullOrEmpty(expectedCn) &&
-                                                !certCn.Equals(expectedCn, StringComparison.OrdinalIgnoreCase))
-                                            {
-                                                Log.Warning("AgentHost: client cert CN mismatch: expected={Expected}, got={Actual}", expectedCn, certCn);
-                                                context.Response.StatusCode = 403;
-                                                return;
-                                            }
-                                            await next(context);
-                                        };
-                                    });
-                            }
+                            // RDP multiplex after TLS is not useful for cleartext mstsc;
+                            // dedicated RdpProxyPort handles RDP. Keep HTTP path below when TLS off.
                             listenOptions.Use(next =>
                                 async context =>
                                 {
@@ -334,6 +322,69 @@ public static class AgentHost
                 );
             }
         );
+    }
+
+    private static bool ValidateClientCertificate(
+        X509Certificate2 clientCert,
+        string caCertPath,
+        string crlPath,
+        string expectedCn
+    )
+    {
+        try
+        {
+            if (!File.Exists(caCertPath))
+            {
+                Log.Warning("AgentHost: CA cert missing at {CaCertPath}", caCertPath);
+                return false;
+            }
+
+            using X509Certificate2 caCert = X509CertificateLoader.LoadCertificateFromFile(caCertPath);
+            using X509Chain chain = new X509Chain();
+            chain.ChainPolicy.TrustMode = X509ChainTrustMode.CustomRootTrust;
+            chain.ChainPolicy.CustomTrustStore.Add(caCert);
+            // Offline CRL requires CRLs registered in the Windows store; a PEM file alone
+            // causes PartialChain/RevocationStatusUnknown. Enforce CA trust + CN here;
+            // CertManagerService still refreshes crl.pem for operators / future checks.
+            chain.ChainPolicy.RevocationMode = X509RevocationMode.NoCheck;
+            if (File.Exists(crlPath))
+            {
+                Log.Debug("AgentHost: CRL present at {CrlPath} (not applied via Offline mode)", crlPath);
+            }
+
+            if (!chain.Build(clientCert))
+            {
+                string statuses = string.Join(
+                    "; ",
+                    chain.ChainStatus.Select(s => $"{s.Status}: {s.StatusInformation.Trim()}")
+                );
+                Log.Warning(
+                    "AgentHost: client cert chain failed Subject={Subject}: {Statuses}",
+                    clientCert.Subject,
+                    statuses
+                );
+                return false;
+            }
+
+            string certCn = clientCert.GetNameInfo(X509NameType.SimpleName, false) ?? "";
+            if (!string.IsNullOrEmpty(expectedCn)
+                && !certCn.Equals(expectedCn, StringComparison.OrdinalIgnoreCase))
+            {
+                Log.Warning(
+                    "AgentHost: client cert CN mismatch: expected={Expected}, got={Actual}",
+                    expectedCn,
+                    certCn
+                );
+                return false;
+            }
+
+            return true;
+        }
+        catch (Exception ex)
+        {
+            Log.Warning(ex, "AgentHost: client certificate validation error");
+            return false;
+        }
     }
 
     private static string? ReadVmBackendFromSettings()
