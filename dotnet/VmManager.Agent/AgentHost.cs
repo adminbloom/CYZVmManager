@@ -343,13 +343,14 @@ public static class AgentHost
             using X509Chain chain = new X509Chain();
             chain.ChainPolicy.TrustMode = X509ChainTrustMode.CustomRootTrust;
             chain.ChainPolicy.CustomTrustStore.Add(caCert);
-            // Offline CRL requires CRLs registered in the Windows store; a PEM file alone
-            // causes PartialChain/RevocationStatusUnknown. Enforce CA trust + CN here;
-            // CertManagerService still refreshes crl.pem for operators / future checks.
-            chain.ChainPolicy.RevocationMode = X509RevocationMode.NoCheck;
+            // Online mode: Schannel performs OCSP (primary, per spec 3.2) and uses
+            // the Windows CRL cache as backup. Offline mode requires CRLs registered
+            // in the Windows store; a PEM file alone causes PartialChain/RevocationStatusUnknown.
+            // CertManagerService still refreshes crl.pem for operators / Rust fallback.
+            chain.ChainPolicy.RevocationMode = X509RevocationMode.Online;
             if (File.Exists(crlPath))
             {
-                Log.Debug("AgentHost: CRL present at {CrlPath} (not applied via Offline mode)", crlPath);
+                Log.Debug("AgentHost: CRL present at {CrlPath} (OCSP is primary, CRL is backup)", crlPath);
             }
 
             if (!chain.Build(clientCert))
