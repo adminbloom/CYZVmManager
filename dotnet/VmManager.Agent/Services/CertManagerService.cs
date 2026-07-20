@@ -1,8 +1,117 @@
+using System.Security.Cryptography;
 using System.Security.Cryptography.X509Certificates;
 using Microsoft.Extensions.Hosting;
 using Serilog;
 
 namespace VmManager.Agent.Services;
+
+// -------------------------------------------------------------------------
+// CertLifecycleState - states for the cert lifecycle state machine.
+// See mtls_client_spec.md Section 11 for the full state machine definition.
+// -------------------------------------------------------------------------
+public enum CertLifecycleState
+{
+    NoCert,
+    HaveValid,
+    Renewing,
+    Bootstrapping
+}
+
+public enum CertAction
+{
+    Wait,
+    Renew,
+    Bootstrap
+}
+
+// -------------------------------------------------------------------------
+// CertLifecycle - implements the 4-state cert lifecycle state machine.
+// -------------------------------------------------------------------------
+public class CertLifecycle
+{
+    private static readonly int[] BackoffSchedule = { 30, 60, 120, 300 };
+    private CertLifecycleState _state = CertLifecycleState.NoCert;
+    private int _backoffAttempt;
+    private readonly Random _rng = new();
+
+    public CertLifecycleState State => _state;
+    public int BackoffAttempt => _backoffAttempt;
+
+    public CertAction Tick(string certPem)
+    {
+        switch (_state)
+        {
+            case CertLifecycleState.NoCert:
+                _state = CertLifecycleState.Bootstrapping;
+                return CertAction.Bootstrap;
+
+            case CertLifecycleState.HaveValid:
+                if (IsCertPemExpired(certPem))
+                {
+                    _state = CertLifecycleState.Bootstrapping;
+                    return CertAction.Bootstrap;
+                }
+                _state = CertLifecycleState.Renewing;
+                return CertAction.Renew;
+
+            case CertLifecycleState.Renewing:
+            case CertLifecycleState.Bootstrapping:
+                return CertAction.Wait;
+
+            default:
+                return CertAction.Wait;
+        }
+    }
+
+    public void OnSuccess()
+    {
+        if (_backoffAttempt > 0)
+            Log.Information("CertManagerService: cert lifecycle recovered after {Attempts} failed attempts", _backoffAttempt);
+        _backoffAttempt = 0;
+        _state = CertLifecycleState.HaveValid;
+    }
+
+    public void OnFailure(bool certWasExpired)
+    {
+        _backoffAttempt++;
+        if (_state == CertLifecycleState.Renewing)
+        {
+            _state = certWasExpired ? CertLifecycleState.Bootstrapping : CertLifecycleState.HaveValid;
+        }
+        // if Bootstrapping, stay in Bootstrapping (retry with backoff)
+    }
+
+    public int GetWaitSeconds(int rotationIntervalSec)
+    {
+        if (_backoffAttempt > 0)
+        {
+            int idx = Math.Min(_backoffAttempt - 1, BackoffSchedule.Length - 1);
+            return BackoffSchedule[idx] + _rng.Next(0, 61);
+        }
+        return rotationIntervalSec + _rng.Next(0, 61);
+    }
+
+    public void Reset()
+    {
+        _state = CertLifecycleState.NoCert;
+        _backoffAttempt = 0;
+    }
+
+    private static bool IsCertPemExpired(string certPem)
+    {
+        if (string.IsNullOrWhiteSpace(certPem))
+            return true;
+        try
+        {
+            using var cert = new X509Certificate2(System.Text.Encoding.UTF8.GetBytes(certPem));
+            return DateTime.UtcNow >= cert.NotAfter;
+        }
+        catch
+        {
+            return true;
+        }
+    }
+}
 
 public class CertManagerService : IHostedService, IDisposable
 {
@@ -13,8 +122,10 @@ public class CertManagerService : IHostedService, IDisposable
 
     private readonly SettingsService _settingsService;
     private readonly ILogger<CertManagerService> _logger;
-    private Timer? _certTimer;
     private Timer? _crlTimer;
+    private Task? _certRotationTask;
+    private CancellationTokenSource? _certCts;
+    private readonly CertLifecycle _lifecycle = new();
     private readonly object _lock = new();
     private volatile bool _isCertValid;
     private byte[]? _crlBytes;
@@ -65,15 +176,14 @@ public class CertManagerService : IHostedService, IDisposable
             throw new InvalidOperationException("CertManagerService: initial cert fetch failed");
         }
 
+        _lifecycle.OnSuccess();
+
         await FetchCrlAsync(settings);
         LoadCaCertBytes();
 
-        _certTimer = new Timer(
-            _ => _ = RefreshCertAsync(),
-            null,
-            TimeSpan.FromSeconds(CertRefreshIntervalSec),
-            TimeSpan.FromSeconds(CertRefreshIntervalSec)
-        );
+        _certCts = new CancellationTokenSource();
+        _certRotationTask = Task.Run(() => CertRotationLoopAsync(_certCts.Token));
+
         _crlTimer = new Timer(
             _ => _ = RefreshCrlAsync(),
             null,
@@ -81,16 +191,21 @@ public class CertManagerService : IHostedService, IDisposable
             TimeSpan.FromSeconds(CrlRefreshIntervalSec)
         );
 
-        _logger.LogInformation("CertManagerService started (cert refresh={Sec}s, crl refresh={CrlSec}s)",
-            CertRefreshIntervalSec, CrlRefreshIntervalSec);
+        _logger.LogInformation("CertManagerService started (cert lifecycle state machine, crl refresh={CrlSec}s)",
+            CrlRefreshIntervalSec);
     }
 
     public async Task StopAsync(CancellationToken cancellationToken)
     {
-        _certTimer?.Change(Timeout.Infinite, 0);
+        _certCts?.Cancel();
+        try
+        {
+            if (_certRotationTask != null)
+                await _certRotationTask;
+        }
+        catch (OperationCanceledException) { }
         _crlTimer?.Change(Timeout.Infinite, 0);
         _logger.LogInformation("CertManagerService stopped");
-        await Task.CompletedTask;
     }
 
     private async Task EnsureCaCertAsync(AppSettings settings)
@@ -239,6 +354,198 @@ public class CertManagerService : IHostedService, IDisposable
         return false;
     }
 
+    private async Task<bool> RenewCertAsync(AppSettings settings)
+    {
+        if (!File.Exists(settings.ServerCertPath) || !File.Exists(settings.ServerKeyPath))
+            return false;
+
+        var provider = CertProviderFactory.Create(
+            settings.CertProvider,
+            settings.CertServerUrl,
+            settings.CertServerAuthToken,
+            settings.CaCertPath,
+            settings.CrlUrl,
+            _logger,
+            settings.StepCaTokenCommand
+        );
+
+        try
+        {
+            string existingCert = File.ReadAllText(settings.ServerCertPath);
+            string existingKey = File.ReadAllText(settings.ServerKeyPath);
+            var renewResult = await provider.RenewCertAsync(existingCert, existingKey);
+            if (renewResult.Valid)
+            {
+                lock (_lock)
+                {
+                    File.WriteAllText(settings.ServerCertPath, renewResult.CertPem);
+                    _isCertValid = true;
+                }
+                _logger.LogInformation("CertManagerService: cert renewed via mTLS /renew, expiry={Expiry}",
+                    renewResult.Expiry);
+                return true;
+            }
+        }
+        catch (Exception e)
+        {
+            _logger.LogWarning("CertManagerService: mTLS renewal failed: {Error}", e.Message);
+        }
+        return false;
+    }
+
+    private async Task<bool> BootstrapCertAsync(AppSettings settings)
+    {
+        var provider = CertProviderFactory.Create(
+            settings.CertProvider,
+            settings.CertServerUrl,
+            settings.CertServerAuthToken,
+            settings.CaCertPath,
+            settings.CrlUrl,
+            _logger,
+            settings.StepCaTokenCommand
+        );
+
+        string lastErr = "";
+        for (int attempt = 0; attempt < MaxRetries; attempt++)
+        {
+            try
+            {
+                var sanIps = CertProviderFactory.GetAgentLanIps();
+                var (csrPem, keyPem) = CertProviderFactory.GenerateCsr("bloomce-agent", sanIps: sanIps);
+                var result = await provider.SignCsrAsync(csrPem, sanIps: sanIps);
+
+                if (result.Valid)
+                {
+                    lock (_lock)
+                    {
+                        File.WriteAllText(settings.ServerCertPath, result.CertPem);
+                        File.WriteAllText(settings.ServerKeyPath, keyPem);
+                        _isCertValid = true;
+                    }
+                    _logger.LogInformation("CertManagerService: fetched server cert via CSR bootstrap, expiry={Expiry}",
+                        result.Expiry);
+                    return true;
+                }
+                lastErr = "sign_csr returned invalid result";
+            }
+            catch (Exception e)
+            {
+                lastErr = e.Message;
+            }
+            if (attempt < MaxRetries - 1)
+                await Task.Delay(TimeSpan.FromSeconds(RetryBackoffBaseSec * Math.Pow(2, attempt) + Random.Shared.NextDouble()));
+        }
+
+        _logger.LogWarning("CertManagerService: CSR-based issuance failed, falling back to /issue-cert: {Error}", lastErr);
+        try
+        {
+            var certResult = await provider.GetCertAsync("bloomce-agent");
+            if (certResult.Valid)
+            {
+                lock (_lock)
+                {
+                    File.WriteAllText(settings.ServerCertPath, certResult.CertPem);
+                    File.WriteAllText(settings.ServerKeyPath, certResult.KeyPem);
+                    _isCertValid = true;
+                }
+                _logger.LogInformation("CertManagerService: fetched server cert via legacy /issue-cert");
+                return true;
+            }
+        }
+        catch (Exception e)
+        {
+            _logger.LogError("CertManagerService: legacy fallback failed: {Error}", e.Message);
+        }
+
+        lock (_lock)
+            _isCertValid = false;
+        return false;
+    }
+
+    private async Task CertRotationLoopAsync(CancellationToken ct)
+    {
+        while (!ct.IsCancellationRequested)
+        {
+            int waitSec = _lifecycle.GetWaitSeconds(CertRefreshIntervalSec);
+            _logger.LogDebug("CertManagerService: lifecycle state={State}, waiting {Wait}s",
+                _lifecycle.State, waitSec);
+
+            try
+            {
+                await Task.Delay(TimeSpan.FromSeconds(waitSec), ct);
+            }
+            catch (OperationCanceledException)
+            {
+                break;
+            }
+
+            if (ct.IsCancellationRequested)
+                break;
+
+            var settings = _settingsService.Load();
+            string certPem = File.Exists(settings.ServerCertPath)
+                ? File.ReadAllText(settings.ServerCertPath)
+                : "";
+
+            CertAction action = _lifecycle.Tick(certPem);
+            bool success = false;
+
+            switch (action)
+            {
+                case CertAction.Renew:
+                    success = await RenewCertAsync(settings);
+                    if (!success)
+                    {
+                        bool wasExpired = IsCertPemExpired(certPem);
+                        _lifecycle.OnFailure(wasExpired);
+                        if (wasExpired)
+                        {
+                            _logger.LogWarning("CertManagerService: cert expired, falling back to bootstrap");
+                            success = await BootstrapCertAsync(settings);
+                            if (success)
+                                _lifecycle.OnSuccess();
+                        }
+                    }
+                    else
+                    {
+                        _lifecycle.OnSuccess();
+                    }
+                    break;
+
+                case CertAction.Bootstrap:
+                    success = await BootstrapCertAsync(settings);
+                    if (success)
+                        _lifecycle.OnSuccess();
+                    else
+                        _lifecycle.OnFailure(false);
+                    break;
+
+                case CertAction.Wait:
+                default:
+                    break;
+            }
+
+            if (success)
+                _logger.LogInformation("CertManagerService: cert rotated successfully (state={State})",
+                    _lifecycle.State);
+        }
+    }
+
+    private static bool IsCertPemExpired(string certPem)
+    {
+        if (string.IsNullOrWhiteSpace(certPem))
+            return true;
+        try
+        {
+            using var cert = new X509Certificate2(System.Text.Encoding.UTF8.GetBytes(certPem));
+            return DateTime.UtcNow >= cert.NotAfter;
+        }
+        catch
+        {
+            return true;
+        }
+    }
+
     private async Task FetchCrlAsync(AppSettings settings)
     {
         var provider = CertProviderFactory.Create(
@@ -307,13 +614,6 @@ public class CertManagerService : IHostedService, IDisposable
         }
     }
 
-    private async Task RefreshCertAsync()
-    {
-        var settings = _settingsService.Load();
-        if (await FetchCertAsync(settings))
-            _logger.LogInformation("CertManagerService: cert refreshed");
-    }
-
     private async Task RefreshCrlAsync()
     {
         var settings = _settingsService.Load();
@@ -322,7 +622,7 @@ public class CertManagerService : IHostedService, IDisposable
 
     public void Dispose()
     {
-        _certTimer?.Dispose();
+        _certCts?.Dispose();
         _crlTimer?.Dispose();
     }
 
