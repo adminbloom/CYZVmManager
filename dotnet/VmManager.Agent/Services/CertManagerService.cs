@@ -299,8 +299,10 @@ public class CertManagerService : IHostedService, IDisposable
             try
             {
                 var sanIps = CertProviderFactory.GetAgentLanIps();
-                var (csrPem, keyPem) = CertProviderFactory.GenerateCsr("bloomce-agent", sanIps: sanIps);
-                var result = await provider.SignCsrAsync(csrPem, sanIps: sanIps);
+                var sanDns = new List<string> { "bloomce-agent" };
+                var (csrPem, keyPem) = CertProviderFactory.GenerateCsr(
+                    "bloomce-agent", sanIps: sanIps, sanDns: sanDns);
+                var result = await provider.SignCsrAsync(csrPem, sanIps: sanIps, sanDns: sanDns);
 
                 if (result.Valid)
                 {
@@ -411,8 +413,10 @@ public class CertManagerService : IHostedService, IDisposable
             try
             {
                 var sanIps = CertProviderFactory.GetAgentLanIps();
-                var (csrPem, keyPem) = CertProviderFactory.GenerateCsr("bloomce-agent", sanIps: sanIps);
-                var result = await provider.SignCsrAsync(csrPem, sanIps: sanIps);
+                var sanDns = new List<string> { "bloomce-agent" };
+                var (csrPem, keyPem) = CertProviderFactory.GenerateCsr(
+                    "bloomce-agent", sanIps: sanIps, sanDns: sanDns);
+                var result = await provider.SignCsrAsync(csrPem, sanIps: sanIps, sanDns: sanDns);
 
                 if (result.Valid)
                 {

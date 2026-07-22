@@ -196,7 +196,8 @@ public class StepCaCertProvider : ICertProvider
         _baseUrl = CertProviderFactory.StripUrlPath(certServerUrl);
         _authToken = authToken;
         _caCertPath = caCertPath;
-        _crlUrl = string.IsNullOrEmpty(crlUrl) ? $"{_baseUrl}/crl" : crlUrl;
+        // Official step-ca CRL path is /1.0/crl (also on insecureAddress over HTTP).
+        _crlUrl = string.IsNullOrEmpty(crlUrl) ? $"{_baseUrl}/1.0/crl" : crlUrl;
         _tokenCommand = tokenCommand ?? "";
         _logger = logger;
     }
@@ -210,7 +211,7 @@ public class StepCaCertProvider : ICertProvider
     {
         try
         {
-            string ott = await GetFreshTokenAsync();
+            string ott = await GetFreshTokenAsync(sanIps, sanDns);
 
             var payload = new Dictionary<string, object> { ["csr"] = csrPem, ["ott"] = ott };
 
@@ -235,7 +236,9 @@ public class StepCaCertProvider : ICertProvider
                 return new SignCsrResult { CertPem = certPem, Expiry = expiry };
             }
 
-            _logger.LogError("StepCaCertProvider: /sign failed: HTTP {Status}", resp.StatusCode);
+            string errBody = await resp.Content.ReadAsStringAsync();
+            _logger.LogError("StepCaCertProvider: /sign failed: HTTP {Status} {Body}",
+                resp.StatusCode, errBody.Length > 200 ? errBody[..200] : errBody);
         }
         catch (Exception e)
         {
@@ -313,41 +316,58 @@ public class StepCaCertProvider : ICertProvider
     }
 
     /// <summary>
-    /// Fetch CRL from step-ca. step-ca does not enable a CRL endpoint by default.
-    /// Returns an empty string on 404 (no revoked certs).
+    /// Fetch CRL from step-ca (/1.0/crl). Tries configured URL then common aliases.
     /// </summary>
     public async Task<string?> FetchCrlAsync()
     {
-        try
+        var urls = new List<string> { _crlUrl };
+        foreach (var alt in new[] { $"{_baseUrl}/1.0/crl", $"{_baseUrl}/crl" })
         {
-            using var handler = CreateHandler();
-            using var client = new HttpClient(handler) { Timeout = TimeSpan.FromSeconds(10) };
-            HttpResponseMessage resp = await client.GetAsync(_crlUrl);
-            if (resp.IsSuccessStatusCode)
-                return await resp.Content.ReadAsStringAsync();
-            if (resp.StatusCode == System.Net.HttpStatusCode.NotFound)
+            if (!urls.Contains(alt))
+                urls.Add(alt);
+        }
+
+        using var handler = CreateHandler();
+        using var client = new HttpClient(handler) { Timeout = TimeSpan.FromSeconds(10) };
+        foreach (string url in urls)
+        {
+            try
             {
-                _logger.LogInformation("StepCaCertProvider: CRL endpoint not configured (404), returning empty CRL");
-                return "";
+                HttpResponseMessage resp = await client.GetAsync(url);
+                if (resp.IsSuccessStatusCode)
+                {
+                    byte[] raw = await resp.Content.ReadAsByteArrayAsync();
+                    return NormalizeCrlToPem(raw);
+                }
+                if (resp.StatusCode == System.Net.HttpStatusCode.NotFound)
+                    continue;
+                _logger.LogWarning("StepCaCertProvider: fetch_crl failed: HTTP {Status} from {Url}",
+                    resp.StatusCode, url);
             }
-            _logger.LogWarning("StepCaCertProvider: fetch_crl failed: HTTP {Status}", resp.StatusCode);
+            catch (Exception e)
+            {
+                _logger.LogWarning("StepCaCertProvider: fetch_crl exception for {Url}: {Error}",
+                    url, e.Message);
+            }
         }
-        catch (Exception e)
-        {
-            _logger.LogWarning("StepCaCertProvider: fetch_crl exception: {Error}", e.Message);
-        }
+        _logger.LogInformation("StepCaCertProvider: CRL endpoint not available");
         return null;
     }
 
     /// <summary>
-    /// Fetch root CA cert. step-ca exposes root certs at /roots.pem (PEM bundle).
+    /// Fetch CA trust bundle: roots.pem + intermediates.pem (leafs are signed by intermediate).
     /// Falls back to local file at _caCertPath.
     /// </summary>
     public async Task<string?> FetchCaCertAsync()
     {
         if (File.Exists(_caCertPath))
         {
-            try { return File.ReadAllText(_caCertPath); }
+            try
+            {
+                string existing = File.ReadAllText(_caCertPath);
+                if (existing.Split("BEGIN CERTIFICATE", StringSplitOptions.None).Length > 2)
+                    return existing;
+            }
             catch { /* fall through to network fetch */ }
         }
 
@@ -355,14 +375,24 @@ public class StepCaCertProvider : ICertProvider
         {
             using var handler = CreateHandler();
             using var client = new HttpClient(handler) { Timeout = TimeSpan.FromSeconds(10) };
-            HttpResponseMessage resp = await client.GetAsync($"{_baseUrl}/roots.pem");
-            if (resp.IsSuccessStatusCode)
+            HttpResponseMessage rootsResp = await client.GetAsync($"{_baseUrl}/roots.pem");
+            HttpResponseMessage intResp = await client.GetAsync($"{_baseUrl}/intermediates.pem");
+            if (rootsResp.IsSuccessStatusCode && intResp.IsSuccessStatusCode)
             {
-                string pem = await resp.Content.ReadAsStringAsync();
+                string roots = await rootsResp.Content.ReadAsStringAsync();
+                string intermediates = await intResp.Content.ReadAsStringAsync();
+                string bundle = (roots.TrimEnd() + "\n" + intermediates.TrimEnd() + "\n");
+                if (bundle.Contains("BEGIN CERTIFICATE"))
+                    return bundle;
+            }
+            if (rootsResp.IsSuccessStatusCode)
+            {
+                string pem = await rootsResp.Content.ReadAsStringAsync();
                 if (pem.Contains("BEGIN CERTIFICATE"))
                     return pem;
             }
-            _logger.LogWarning("StepCaCertProvider: fetch_ca_cert failed: HTTP {Status}", resp.StatusCode);
+            _logger.LogWarning("StepCaCertProvider: fetch_ca_cert failed: roots={R} intermediates={I}",
+                rootsResp.StatusCode, intResp.StatusCode);
         }
         catch (Exception e)
         {
@@ -373,16 +403,38 @@ public class StepCaCertProvider : ICertProvider
 
     /// <summary>
     /// Run the configured token command to obtain a fresh JWT (one-time token).
+    /// Appends --san for each DNS/IP so CSR SANs match the OTT (step-ca requirement).
     /// Falls back to _authToken if no command is configured.
     /// </summary>
-    private async Task<string> GetFreshTokenAsync()
+    private async Task<string> GetFreshTokenAsync(List<string>? sanIps = null, List<string>? sanDns = null)
     {
         if (!string.IsNullOrEmpty(_tokenCommand))
         {
+            var cmd = _tokenCommand;
+            var extras = new List<string>();
+            if (sanDns != null)
+            {
+                foreach (var dns in sanDns)
+                {
+                    if (!string.IsNullOrWhiteSpace(dns))
+                        extras.Add($"--san \"{dns.Replace("\"", "")}\"");
+                }
+            }
+            if (sanIps != null)
+            {
+                foreach (var ip in sanIps)
+                {
+                    if (!string.IsNullOrWhiteSpace(ip))
+                        extras.Add($"--san \"{ip.Replace("\"", "")}\"");
+                }
+            }
+            if (extras.Count > 0)
+                cmd = $"{cmd} {string.Join(" ", extras)}";
+
             var psi = new ProcessStartInfo
             {
                 FileName = "cmd.exe",
-                Arguments = $"/c {_tokenCommand}",
+                Arguments = $"/c {cmd}",
                 UseShellExecute = false,
                 RedirectStandardOutput = true,
                 RedirectStandardError = true,
@@ -391,8 +443,24 @@ public class StepCaCertProvider : ICertProvider
             using var proc = Process.Start(psi);
             if (proc != null)
             {
-                string output = await proc.StandardOutput.ReadToEndAsync();
-                await proc.WaitForExitAsync();
+                var stdoutTask = proc.StandardOutput.ReadToEndAsync();
+                var stderrTask = proc.StandardError.ReadToEndAsync();
+                using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(45));
+                try
+                {
+                    await proc.WaitForExitAsync(cts.Token);
+                }
+                catch (OperationCanceledException)
+                {
+                    try { proc.Kill(entireProcessTree: true); } catch { /* ignore */ }
+                    _logger.LogWarning("StepCaCertProvider: token command timed out");
+                    return _authToken;
+                }
+                string output = await stdoutTask;
+                string err = await stderrTask;
+                if (proc.ExitCode != 0)
+                    _logger.LogWarning("StepCaCertProvider: token command rc={Code} stderr={Err}",
+                        proc.ExitCode, err.Length > 300 ? err[..300] : err);
                 string trimmed = output.Trim();
                 foreach (var line in trimmed.Split('\n'))
                 {
@@ -402,11 +470,22 @@ public class StepCaCertProvider : ICertProvider
                 }
                 if (trimmed.StartsWith("eyJ"))
                     return trimmed;
-                return trimmed;
+                return string.IsNullOrEmpty(trimmed) ? _authToken : trimmed;
             }
         }
         _logger.LogWarning("StepCaCertProvider: no token command configured, using static auth_token as OTT (security risk)");
         return _authToken;
+    }
+
+    private static string NormalizeCrlToPem(byte[] raw)
+    {
+        if (raw == null || raw.Length == 0)
+            return "";
+        string asText = System.Text.Encoding.ASCII.GetString(raw);
+        if (asText.Contains("-----BEGIN", StringComparison.Ordinal))
+            return asText;
+        string b64 = Convert.ToBase64String(raw, Base64FormattingOptions.InsertLineBreaks);
+        return "-----BEGIN X509 CRL-----\n" + b64 + "\n-----END X509 CRL-----\n";
     }
 
     private static string ExtractCertPem(string body)

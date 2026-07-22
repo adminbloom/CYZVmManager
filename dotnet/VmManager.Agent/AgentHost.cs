@@ -339,53 +339,102 @@ public static class AgentHost
                 return false;
             }
 
-            using X509Certificate2 caCert = X509CertificateLoader.LoadCertificateFromFile(caCertPath);
-            using X509Chain chain = new X509Chain();
-            chain.ChainPolicy.TrustMode = X509ChainTrustMode.CustomRootTrust;
-            chain.ChainPolicy.CustomTrustStore.Add(caCert);
-            // Online mode: Schannel performs OCSP (primary, per spec 3.2) and uses
-            // the Windows CRL cache as backup. Offline mode requires CRLs registered
-            // in the Windows store; a PEM file alone causes PartialChain/RevocationStatusUnknown.
-            // CertManagerService still refreshes crl.pem for operators / Rust fallback.
-            chain.ChainPolicy.RevocationMode = X509RevocationMode.Online;
-            if (File.Exists(crlPath))
+            // ca_cert.pem is a PEM *bundle* (root + intermediate). LoadCertificateFromFile
+            // only reads the first cert; trusting root alone yields PartialChain for leaves
+            // signed by the intermediate (TLS alert certificate_unknown to clients).
+            List<X509Certificate2> caCerts = LoadPemCertificateBundle(caCertPath);
+            if (caCerts.Count == 0)
             {
-                Log.Debug("AgentHost: CRL present at {CrlPath} (OCSP is primary, CRL is backup)", crlPath);
-            }
-
-            if (!chain.Build(clientCert))
-            {
-                string statuses = string.Join(
-                    "; ",
-                    chain.ChainStatus.Select(s => $"{s.Status}: {s.StatusInformation.Trim()}")
-                );
-                Log.Warning(
-                    "AgentHost: client cert chain failed Subject={Subject}: {Statuses}",
-                    clientCert.Subject,
-                    statuses
-                );
+                Log.Warning("AgentHost: no certificates found in CA bundle {CaCertPath}", caCertPath);
                 return false;
             }
 
-            string certCn = clientCert.GetNameInfo(X509NameType.SimpleName, false) ?? "";
-            if (!string.IsNullOrEmpty(expectedCn)
-                && !certCn.Equals(expectedCn, StringComparison.OrdinalIgnoreCase))
+            try
             {
-                Log.Warning(
-                    "AgentHost: client cert CN mismatch: expected={Expected}, got={Actual}",
-                    expectedCn,
-                    certCn
-                );
-                return false;
-            }
+                using X509Chain chain = new X509Chain();
+                chain.ChainPolicy.TrustMode = X509ChainTrustMode.CustomRootTrust;
+                foreach (X509Certificate2 ca in caCerts)
+                {
+                    if (ca.Subject == ca.Issuer)
+                        chain.ChainPolicy.CustomTrustStore.Add(ca);
+                    else
+                        chain.ChainPolicy.ExtraStore.Add(ca);
+                }
+                // Multi-PEM ExtraStore is required for intermediate-issued client certs.
+                // step-ca short-lived leaves often lack OCSP AIA; Online mode then fails
+                // Build with RevocationStatusUnknown → TLS alert certificate_unknown.
+                // Short TTL is the primary revocation mechanism; keep CRL on disk for ops.
+                chain.ChainPolicy.RevocationMode = X509RevocationMode.NoCheck;
+                if (File.Exists(crlPath))
+                {
+                    Log.Debug("AgentHost: CRL present at {CrlPath} (not applied; NoCheck mode)", crlPath);
+                }
 
-            return true;
+                if (!chain.Build(clientCert))
+                {
+                    string statuses = string.Join(
+                        "; ",
+                        chain.ChainStatus.Select(s => $"{s.Status}: {s.StatusInformation.Trim()}")
+                    );
+                    Log.Warning(
+                        "AgentHost: client cert chain failed Subject={Subject}: {Statuses}",
+                        clientCert.Subject,
+                        statuses
+                    );
+                    return false;
+                }
+
+                string certCn = clientCert.GetNameInfo(X509NameType.SimpleName, false) ?? "";
+                if (!string.IsNullOrEmpty(expectedCn)
+                    && !certCn.Equals(expectedCn, StringComparison.OrdinalIgnoreCase))
+                {
+                    Log.Warning(
+                        "AgentHost: client cert CN mismatch: expected={Expected}, got={Actual}",
+                        expectedCn,
+                        certCn
+                    );
+                    return false;
+                }
+
+                return true;
+            }
+            finally
+            {
+                foreach (X509Certificate2 ca in caCerts)
+                    ca.Dispose();
+            }
         }
         catch (Exception ex)
         {
             Log.Warning(ex, "AgentHost: client certificate validation error");
             return false;
         }
+    }
+
+    /// <summary>
+    /// Load all CERTIFICATE blocks from a PEM file (root + intermediates).
+    /// </summary>
+    private static List<X509Certificate2> LoadPemCertificateBundle(string pemPath)
+    {
+        List<X509Certificate2> certs = new();
+        string pem = File.ReadAllText(pemPath);
+        const string begin = "-----BEGIN CERTIFICATE-----";
+        const string end = "-----END CERTIFICATE-----";
+        int search = 0;
+        while (true)
+        {
+            int start = pem.IndexOf(begin, search, StringComparison.Ordinal);
+            if (start < 0)
+                break;
+            int stop = pem.IndexOf(end, start, StringComparison.Ordinal);
+            if (stop < 0)
+                break;
+            stop += end.Length;
+            string block = pem[start..stop];
+            certs.Add(X509Certificate2.CreateFromPem(block));
+            search = stop;
+        }
+        return certs;
     }
 
     private static string? ReadVmBackendFromSettings()
