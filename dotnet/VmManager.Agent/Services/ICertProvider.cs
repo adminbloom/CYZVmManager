@@ -360,20 +360,13 @@ public class StepCaCertProvider : ICertProvider
     /// </summary>
     public async Task<string?> FetchCaCertAsync()
     {
-        if (File.Exists(_caCertPath))
-        {
-            try
-            {
-                string existing = File.ReadAllText(_caCertPath);
-                if (existing.Split("BEGIN CERTIFICATE", StringSplitOptions.None).Length > 2)
-                    return existing;
-            }
-            catch { /* fall through to network fetch */ }
-        }
-
+        // Always prefer a fresh roots+intermediates bundle from step-ca.
+        // A stale root-only file on disk must not short-circuit the download
+        // (portal client certs are intermediate-signed → unknown_ca otherwise).
         try
         {
             using var handler = CreateHandler();
+            // When no CA file exists yet, CreateHandler already skips verification.
             using var client = new HttpClient(handler) { Timeout = TimeSpan.FromSeconds(10) };
             HttpResponseMessage rootsResp = await client.GetAsync($"{_baseUrl}/roots.pem");
             HttpResponseMessage intResp = await client.GetAsync($"{_baseUrl}/intermediates.pem");
@@ -382,7 +375,8 @@ public class StepCaCertProvider : ICertProvider
                 string roots = await rootsResp.Content.ReadAsStringAsync();
                 string intermediates = await intResp.Content.ReadAsStringAsync();
                 string bundle = (roots.TrimEnd() + "\n" + intermediates.TrimEnd() + "\n");
-                if (bundle.Contains("BEGIN CERTIFICATE"))
+                if (bundle.Contains("BEGIN CERTIFICATE")
+                    && bundle.Split("BEGIN CERTIFICATE", StringSplitOptions.None).Length > 2)
                     return bundle;
             }
             if (rootsResp.IsSuccessStatusCode)
@@ -397,6 +391,17 @@ public class StepCaCertProvider : ICertProvider
         catch (Exception e)
         {
             _logger.LogWarning("StepCaCertProvider: fetch_ca_cert exception: {Error}", e.Message);
+        }
+
+        if (File.Exists(_caCertPath))
+        {
+            try
+            {
+                string existing = File.ReadAllText(_caCertPath);
+                if (existing.Contains("BEGIN CERTIFICATE"))
+                    return existing;
+            }
+            catch { /* ignore */ }
         }
         return null;
     }
@@ -526,10 +531,18 @@ public class StepCaCertProvider : ICertProvider
                     return true;
                 try
                 {
-                    using var caCert = new X509Certificate2(_caCertPath);
                     chain!.ChainPolicy.TrustMode = X509ChainTrustMode.CustomRootTrust;
-                    chain.ChainPolicy.CustomTrustStore.Add(caCert);
-                    chain.ChainPolicy.RevocationMode = X509RevocationMode.Online;
+                    // Roots → CustomTrustStore; intermediates → ExtraStore (required for
+                    // intermediate-signed step-ca / portal leaves).
+                    foreach (var ca in LoadPemCerts(_caCertPath))
+                    {
+                        if (ca.Subject == ca.Issuer)
+                            chain.ChainPolicy.CustomTrustStore.Add(ca);
+                        else
+                            chain.ChainPolicy.ExtraStore.Add(ca);
+                    }
+                    // Online CRL checks hang/fail on LAN step-ca IDP URLs during bootstrap.
+                    chain.ChainPolicy.RevocationMode = X509RevocationMode.NoCheck;
                     return chain.Build(cert!);
                 }
                 catch { return false; }
@@ -537,6 +550,28 @@ public class StepCaCertProvider : ICertProvider
         else
             handler.ServerCertificateCustomValidationCallback = (_, _, _, _) => true;
         return handler;
+    }
+
+    private static List<X509Certificate2> LoadPemCerts(string path)
+    {
+        var list = new List<X509Certificate2>();
+        string pem = File.ReadAllText(path);
+        const string begin = "-----BEGIN CERTIFICATE-----";
+        const string end = "-----END CERTIFICATE-----";
+        int idx = 0;
+        while (true)
+        {
+            int start = pem.IndexOf(begin, idx, StringComparison.Ordinal);
+            if (start < 0) break;
+            int stop = pem.IndexOf(end, start, StringComparison.Ordinal);
+            if (stop < 0) break;
+            stop += end.Length;
+            list.Add(X509Certificate2.CreateFromPem(pem.AsSpan(start, stop - start)));
+            idx = stop;
+        }
+        if (list.Count == 0)
+            list.Add(X509CertificateLoader.LoadCertificateFromFile(path));
+        return list;
     }
 
     /// <summary>
@@ -556,7 +591,17 @@ public class StepCaCertProvider : ICertProvider
         File.WriteAllText(keyFilePath, keyPem);
 
         handler.ClientCertificateOptions = ClientCertificateOption.Manual;
-        handler.ClientCertificates.Add(X509Certificate2.CreateFromPemFile(certFilePath, keyFilePath));
+        // CreateFromPemFile alone yields an ephemeral key that Schannel often cannot
+        // use as a client cert on Windows (SSL connection fails on /renew).
+        using X509Certificate2 pem = X509Certificate2.CreateFromPemFile(certFilePath, keyFilePath);
+        byte[] pfx = pem.Export(X509ContentType.Pkcs12);
+        handler.ClientCertificates.Add(
+            X509CertificateLoader.LoadPkcs12(
+                pfx,
+                password: null,
+                X509KeyStorageFlags.MachineKeySet | X509KeyStorageFlags.Exportable
+            )
+        );
 
         return handler;
     }

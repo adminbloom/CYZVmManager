@@ -54,9 +54,19 @@ public class CertLifecycle
                 _state = CertLifecycleState.Renewing;
                 return CertAction.Renew;
 
+            // IMPORTANT: do not return Wait forever after a failed attempt.
+            // A prior bug left state=Bootstrapping and Tick→Wait, so the agent
+            // never re-enrolled until the Windows service was restarted.
             case CertLifecycleState.Renewing:
+                if (IsCertPemExpired(certPem))
+                {
+                    _state = CertLifecycleState.Bootstrapping;
+                    return CertAction.Bootstrap;
+                }
+                return CertAction.Renew;
+
             case CertLifecycleState.Bootstrapping:
-                return CertAction.Wait;
+                return CertAction.Bootstrap;
 
             default:
                 return CertAction.Wait;
@@ -76,18 +86,49 @@ public class CertLifecycle
         _backoffAttempt++;
         if (_state == CertLifecycleState.Renewing)
         {
-            _state = certWasExpired ? CertLifecycleState.Bootstrapping : CertLifecycleState.HaveValid;
+            // After a failed renew, always allow bootstrap on the next tick
+            // (short-lived leaves leave little room for renew-only retries).
+            _state = CertLifecycleState.Bootstrapping;
         }
-        // if Bootstrapping, stay in Bootstrapping (retry with backoff)
+        // Bootstrapping stays Bootstrapping so Tick retries Bootstrap with backoff.
     }
 
-    public int GetWaitSeconds(int rotationIntervalSec)
+    public int GetWaitSeconds(int rotationIntervalSec, string? certPem = null)
     {
         if (_backoffAttempt > 0)
         {
             int idx = Math.Min(_backoffAttempt - 1, BackoffSchedule.Length - 1);
             return BackoffSchedule[idx] + _rng.Next(0, 61);
         }
+
+        // Schedule renew at ~80% of this leaf's lifetime when we can parse it.
+        if (!string.IsNullOrWhiteSpace(certPem))
+        {
+            try
+            {
+                using var cert = new X509Certificate2(System.Text.Encoding.UTF8.GetBytes(certPem));
+                // X509Certificate2.NotBefore/NotAfter are Local Kind on Windows.
+                // Mixing them with DateTime.UtcNow (no conversion) produced waits of
+                // ~timezone offset + remaining life (e.g. 29537s in UTC+8) so rotation
+                // never ran before the 15m leaf expired.
+                DateTime notBefore = cert.NotBefore.ToUniversalTime();
+                DateTime notAfter = cert.NotAfter.ToUniversalTime();
+                TimeSpan lifetime = notAfter - notBefore;
+                if (lifetime.TotalSeconds > 60)
+                {
+                    DateTime renewAt = notBefore + TimeSpan.FromTicks((long)(lifetime.Ticks * 0.8));
+                    int wait = (int)(renewAt - DateTime.UtcNow).TotalSeconds;
+                    int maxWait = Math.Max(60, (int)(lifetime.TotalSeconds * 0.85));
+                    if (wait < 30)
+                        return 30 + _rng.Next(0, 16);
+                    if (wait > maxWait)
+                        wait = maxWait;
+                    return wait + _rng.Next(0, 31);
+                }
+            }
+            catch { /* fall through */ }
+        }
+
         return rotationIntervalSec + _rng.Next(0, 61);
     }
 
@@ -104,7 +145,7 @@ public class CertLifecycle
         try
         {
             using var cert = new X509Certificate2(System.Text.Encoding.UTF8.GetBytes(certPem));
-            return DateTime.UtcNow >= cert.NotAfter;
+            return DateTime.UtcNow >= cert.NotAfter.ToUniversalTime();
         }
         catch
         {
@@ -210,10 +251,26 @@ public class CertManagerService : IHostedService, IDisposable
 
     private async Task EnsureCaCertAsync(AppSettings settings)
     {
+        // Root-only files break client-cert validation (portal leaves are intermediate-signed).
+        // Re-fetch whenever the on-disk bundle has fewer than 2 PEM blocks.
+        bool haveBundle = false;
         if (File.Exists(settings.CaCertPath) && new FileInfo(settings.CaCertPath).Length > 0)
         {
-            LoadCaCertBytes();
-            return;
+            try
+            {
+                string existing = File.ReadAllText(settings.CaCertPath);
+                haveBundle = existing.Split("BEGIN CERTIFICATE", StringSplitOptions.None).Length > 2;
+            }
+            catch { /* treat as incomplete */ }
+            if (haveBundle)
+            {
+                LoadCaCertBytes();
+                return;
+            }
+            _logger.LogWarning(
+                "CertManagerService: CA file at {Path} is incomplete (need root+intermediate); refreshing",
+                settings.CaCertPath
+            );
         }
 
         var provider = CertProviderFactory.Create(
@@ -229,13 +286,27 @@ public class CertManagerService : IHostedService, IDisposable
         try
         {
             string? caPem = await provider.FetchCaCertAsync();
-            if (!string.IsNullOrWhiteSpace(caPem))
+            if (!string.IsNullOrWhiteSpace(caPem)
+                && caPem.Split("BEGIN CERTIFICATE", StringSplitOptions.None).Length > 2)
             {
                 Directory.CreateDirectory(Path.GetDirectoryName(settings.CaCertPath)!);
                 File.WriteAllText(settings.CaCertPath, caPem);
                 lock (_lock)
                     _caCertBytes = System.Text.Encoding.UTF8.GetBytes(caPem);
-                _logger.LogInformation("CertManagerService: downloaded CA cert to {Path}", settings.CaCertPath);
+                _logger.LogInformation("CertManagerService: downloaded CA bundle to {Path}", settings.CaCertPath);
+                return;
+            }
+            if (!string.IsNullOrWhiteSpace(caPem))
+            {
+                // Accept single-root as last resort but warn — mTLS to portal may fail.
+                Directory.CreateDirectory(Path.GetDirectoryName(settings.CaCertPath)!);
+                File.WriteAllText(settings.CaCertPath, caPem);
+                lock (_lock)
+                    _caCertBytes = System.Text.Encoding.UTF8.GetBytes(caPem);
+                _logger.LogWarning(
+                    "CertManagerService: CA download returned a single cert (no intermediate) at {Path}",
+                    settings.CaCertPath
+                );
                 return;
             }
         }
@@ -250,6 +321,8 @@ public class CertManagerService : IHostedService, IDisposable
                 $"CA cert missing at {settings.CaCertPath} and download from cert server failed"
             );
         }
+
+        LoadCaCertBytes();
     }
 
     private async Task<bool> FetchCertAsync(AppSettings settings)
@@ -470,8 +543,13 @@ public class CertManagerService : IHostedService, IDisposable
     {
         while (!ct.IsCancellationRequested)
         {
-            int waitSec = _lifecycle.GetWaitSeconds(CertRefreshIntervalSec);
-            _logger.LogDebug("CertManagerService: lifecycle state={State}, waiting {Wait}s",
+            var settingsForWait = _settingsService.Load();
+            string certPemForWait = File.Exists(settingsForWait.ServerCertPath)
+                ? File.ReadAllText(settingsForWait.ServerCertPath)
+                : "";
+            int waitSec = _lifecycle.GetWaitSeconds(CertRefreshIntervalSec, certPemForWait);
+            _logger.LogInformation(
+                "CertManagerService: lifecycle state={State}, waiting {Wait}s before next cert action",
                 _lifecycle.State, waitSec);
 
             try
@@ -487,6 +565,13 @@ public class CertManagerService : IHostedService, IDisposable
                 break;
 
             var settings = _settingsService.Load();
+            // Keep CA bundle complete (root+intermediate) across long-running processes.
+            try { await EnsureCaCertAsync(settings); }
+            catch (Exception e)
+            {
+                _logger.LogWarning("CertManagerService: CA refresh during rotation failed: {Error}", e.Message);
+            }
+
             string certPem = File.Exists(settings.ServerCertPath)
                 ? File.ReadAllText(settings.ServerCertPath)
                 : "";
@@ -500,15 +585,14 @@ public class CertManagerService : IHostedService, IDisposable
                     success = await RenewCertAsync(settings);
                     if (!success)
                     {
-                        bool wasExpired = IsCertPemExpired(certPem);
-                        _lifecycle.OnFailure(wasExpired);
-                        if (wasExpired)
-                        {
-                            _logger.LogWarning("CertManagerService: cert expired, falling back to bootstrap");
-                            success = await BootstrapCertAsync(settings);
-                            if (success)
-                                _lifecycle.OnSuccess();
-                        }
+                        _logger.LogWarning(
+                            "CertManagerService: mTLS renew failed; falling back to CSR bootstrap");
+                        _lifecycle.OnFailure(IsCertPemExpired(certPem));
+                        success = await BootstrapCertAsync(settings);
+                        if (success)
+                            _lifecycle.OnSuccess();
+                        else
+                            _lifecycle.OnFailure(true);
                     }
                     else
                     {
@@ -521,7 +605,7 @@ public class CertManagerService : IHostedService, IDisposable
                     if (success)
                         _lifecycle.OnSuccess();
                     else
-                        _lifecycle.OnFailure(false);
+                        _lifecycle.OnFailure(true);
                     break;
 
                 case CertAction.Wait:
@@ -532,6 +616,10 @@ public class CertManagerService : IHostedService, IDisposable
             if (success)
                 _logger.LogInformation("CertManagerService: cert rotated successfully (state={State})",
                     _lifecycle.State);
+            else if (action != CertAction.Wait)
+                _logger.LogWarning(
+                    "CertManagerService: cert action {Action} failed (state={State}, backoff={Backoff})",
+                    action, _lifecycle.State, _lifecycle.BackoffAttempt);
         }
     }
 
@@ -542,7 +630,7 @@ public class CertManagerService : IHostedService, IDisposable
         try
         {
             using var cert = new X509Certificate2(System.Text.Encoding.UTF8.GetBytes(certPem));
-            return DateTime.UtcNow >= cert.NotAfter;
+            return DateTime.UtcNow >= cert.NotAfter.ToUniversalTime();
         }
         catch
         {
