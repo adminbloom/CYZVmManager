@@ -156,14 +156,58 @@ public static class AgentHost
         builder.Services.AddCatalogServices();
         builder.Services.AddAgentServices(vmBackend);
 
+        // OIDC (Keycloak) — optional Bearer JWT alongside Basic
+        var oidcSection = builder.Configuration.GetSection("VmManager:Oidc");
+        bool oidcEnabled = oidcSection.GetValue("Enabled", false);
+        string oidcIssuer = oidcSection.GetValue<string>("Issuer") ?? "";
+        if (oidcEnabled && !string.IsNullOrWhiteSpace(oidcIssuer))
+        {
+            builder.Services.AddSingleton(sp =>
+                new Services.OidcTokenValidator(
+                    issuer: oidcIssuer,
+                    audience: oidcSection.GetValue<string>("Audience") ?? "",
+                    clientId: oidcSection.GetValue<string>("ClientId") ?? "vm-manager",
+                    clientSecret: oidcSection.GetValue<string>("ClientSecret") ?? "",
+                    logger: sp.GetService<ILogger<Services.OidcTokenValidator>>()
+                )
+            );
+            Log.Information("OIDC Bearer auth enabled (issuer={Issuer})", oidcIssuer);
+        }
+        else
+        {
+            Log.Information("OIDC Bearer auth disabled");
+        }
+
         builder
-            .Services.AddAuthentication("Basic")
-            .AddScheme<AuthenticationSchemeOptions, BasicAuthenticationHandler>("Basic", null);
+            .Services.AddAuthentication(options =>
+            {
+                options.DefaultAuthenticateScheme = "Smart";
+                options.DefaultChallengeScheme = "Smart";
+            })
+            .AddPolicyScheme(
+                "Smart",
+                "Smart",
+                options =>
+                {
+                    options.ForwardDefaultSelector = context =>
+                    {
+                        string auth = context.Request.Headers.Authorization.ToString();
+                        if (
+                            oidcEnabled
+                            && auth.StartsWith("Bearer ", StringComparison.OrdinalIgnoreCase)
+                        )
+                            return "Bearer";
+                        return "Basic";
+                    };
+                }
+            )
+            .AddScheme<AuthenticationSchemeOptions, BasicAuthenticationHandler>("Basic", null)
+            .AddScheme<AuthenticationSchemeOptions, OidcAuthenticationHandler>("Bearer", null);
 
         builder.Services.AddSingleton<IAuthorizationHandler, PermissionHandler>();
         builder.Services.AddAuthorization(options =>
         {
-            options.DefaultPolicy = new AuthorizationPolicyBuilder("Basic")
+            options.DefaultPolicy = new AuthorizationPolicyBuilder("Basic", "Bearer")
                 .RequireAuthenticatedUser()
                 .Build();
 
@@ -171,7 +215,10 @@ public static class AgentHost
             {
                 options.AddPolicy(
                     permission,
-                    policy => policy.AddRequirements(new PermissionRequirement(permission))
+                    policy =>
+                        policy
+                            .AddAuthenticationSchemes("Basic", "Bearer")
+                            .AddRequirements(new PermissionRequirement(permission))
                 );
             }
         });

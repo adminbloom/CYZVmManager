@@ -1,12 +1,10 @@
 using System.IdentityModel.Tokens.Jwt;
-using System.Net.Http.Headers;
 using System.Security.Claims;
-using System.Security.Cryptography;
-using Microsoft.Extensions.Logging;
 using Microsoft.IdentityModel.Tokens;
 using System.Text.Json;
+using VmManager.Contracts.Models;
 
-namespace VmManager.Services;
+namespace VmManager.Agent.Services;
 
 /// <summary>
 /// Validates OIDC JWT tokens issued by Keycloak.
@@ -91,7 +89,7 @@ public sealed class OidcTokenValidator : IDisposable
             var handler = new JwtSecurityTokenHandler();
             var principal = handler.ValidateToken(token, validationParams, out var securityToken);
 
-            return PrincipalToUser(principal);
+            return PrincipalToUser(principal, securityToken as JwtSecurityToken);
         }
         catch (Exception ex)
         {
@@ -126,43 +124,87 @@ public sealed class OidcTokenValidator : IDisposable
         return doc.RootElement.GetProperty("access_token").GetString();
     }
 
-    private AuthenticatedUser PrincipalToUser(ClaimsPrincipal principal)
+    private AuthenticatedUser PrincipalToUser(ClaimsPrincipal principal, JwtSecurityToken? jwt)
     {
         var user = new AuthenticatedUser();
         var claims = principal.Claims.ToList();
 
-        user.Username = claims.FirstOrDefault(c => c.Type == "sub")?.Value
-                        ?? claims.FirstOrDefault(c => c.Type == "preferred_username")?.Value
+        user.Username = claims.FirstOrDefault(c => c.Type == "preferred_username")?.Value
+                        ?? claims.FirstOrDefault(c => c.Type == ClaimTypes.NameIdentifier)?.Value
+                        ?? claims.FirstOrDefault(c => c.Type == "sub")?.Value
+                        ?? jwt?.Subject
                         ?? "";
-        user.Email = claims.FirstOrDefault(c => c.Type == "email")?.Value ?? "";
+        user.Email = claims.FirstOrDefault(c => c.Type == "email")?.Value
+                     ?? claims.FirstOrDefault(c => c.Type == ClaimTypes.Email)?.Value
+                     ?? "";
 
-        // Check realm roles for admin
-        var realmAccessClaim = claims.FirstOrDefault(c => c.Type == "realm_access");
-        if (realmAccessClaim != null)
-        {
-            try
-            {
-                using var doc = JsonDocument.Parse(realmAccessClaim.Value);
-                if (doc.RootElement.TryGetProperty("roles", out var rolesEl))
-                {
-                    var roles = rolesEl.EnumerateArray()
-                        .Select(r => r.GetString() ?? "")
-                        .ToList();
-                    user.IsAdmin = roles.Contains("data_admin");
-                }
-            }
-            catch { }
-        }
+        // Keycloak realm roles (roles-and-scopes.md): platform_admin / data_admin / user
+        var roles = ExtractRealmRoles(claims, jwt);
+        // Agent admin = platform or data admin (Hyper-V ops need elevated access)
+        user.IsAdmin = roles.Contains("platform_admin") || roles.Contains("data_admin");
 
-        // Map permissions from scopes
-        var scopeClaim = claims.FirstOrDefault(c => c.Type == "scope");
+        var scopeClaim = claims.FirstOrDefault(c => c.Type == "scope")
+                         ?? claims.FirstOrDefault(c => c.Type == "scp");
         if (scopeClaim != null)
         {
-            var scopes = scopeClaim.Value.Split(' ', StringSplitOptions.RemoveEmptyEntries);
-            user.Permissions = new HashSet<string>(scopes);
+            user.Permissions = new HashSet<string>(
+                scopeClaim.Value.Split(' ', StringSplitOptions.RemoveEmptyEntries)
+            );
+        }
+        else if (jwt?.Payload.TryGetValue("scope", out var scopeObj) == true && scopeObj is string scopeStr)
+        {
+            user.Permissions = new HashSet<string>(
+                scopeStr.Split(' ', StringSplitOptions.RemoveEmptyEntries)
+            );
         }
 
         return user;
+    }
+
+    private static List<string> ExtractRealmRoles(List<Claim> claims, JwtSecurityToken? jwt)
+    {
+        var fromClaim = ExtractRealmRolesFromJson(
+            claims.FirstOrDefault(c => c.Type == "realm_access")?.Value
+        );
+        if (fromClaim.Count > 0)
+            return fromClaim;
+
+        if (jwt?.Payload.TryGetValue("realm_access", out var ra) == true)
+        {
+            string json = ra switch
+            {
+                string s => s,
+                JsonElement je => je.GetRawText(),
+                _ => ra?.ToString() ?? "",
+            };
+            return ExtractRealmRolesFromJson(json);
+        }
+
+        return [];
+    }
+
+    private static List<string> ExtractRealmRolesFromJson(string? json)
+    {
+        if (string.IsNullOrWhiteSpace(json))
+            return [];
+
+        try
+        {
+            using var doc = JsonDocument.Parse(json);
+            if (doc.RootElement.TryGetProperty("roles", out var rolesEl))
+            {
+                return rolesEl.EnumerateArray()
+                    .Select(r => r.GetString() ?? "")
+                    .Where(r => r.Length > 0)
+                    .ToList();
+            }
+        }
+        catch
+        {
+            // ignore malformed realm_access
+        }
+
+        return [];
     }
 
     private OidcDiscoveryDoc GetDiscoveryDoc()
